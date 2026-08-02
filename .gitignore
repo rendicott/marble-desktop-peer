@@ -1,0 +1,24 @@
+# Build output
+/bin/
+*.exe
+*.test
+*.out
+
+# Go
+vendor/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local env / secrets (never commit)
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime data lives in ~/.marble-peer — keep any accidental local copies out
+.marble-peer/
