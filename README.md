@@ -1,28 +1,86 @@
 # marble-desktop-peer
 
-Desktop agent for [Marble](https://github.com/rendicott/marble) (ADR-0020 / ADR-0021).
+Desktop agent for **[Marble](https://github.com/rendicott/marble)** remote computer-use ([ADR-0020](https://github.com/rendicott/marble/blob/main/adr/0020-marble-peer.md) / [ADR-0021](https://github.com/rendicott/marble/blob/main/adr/0021-marble-desktop-peer.md)).
 
-Gives the Marble harness **remote hands and eyes** on your personal machine: desktop screenshots/input and a managed Chrome profile over CDP.
+Gives the Marble harness **remote hands and eyes** on your personal machine: full-desktop screenshots and input, plus a managed Chrome profile over CDP. The harness is the brain (`computer_*` tools); this binary is the hands.
 
 | | |
 |--|--|
 | **Binary** | `marble-peer` |
 | **Module** | `github.com/rendicott/marble-desktop-peer` |
+| **Latest release** | **[v0.1.0](https://github.com/rendicott/marble-desktop-peer/releases/tag/v0.1.0)** |
 | **Data dir** | `~/.marble-peer` (`MARBLE_PEER_HOME`) |
+| **Harness** | Marble ≥ **v0.4.1** (computers registry + peer hub) |
 
-## Build
+## What's new in v0.1.0
+
+- Mutual pair with Marble Settings → Computers  
+- `marble-peer run` daemon (WS dial-out, action queue, mini UI, tray)  
+- Chrome **user mirror** CDP path (default) so logins work without attaching to daily Chrome  
+- Desktop screenshot / click / type / key  
+- Linux autostart + tray; idle/display keep-awake  
+- GitHub Actions multi-arch binaries  
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+## Install (prebuilt)
+
+GitHub Actions builds portable binaries on version tags (`v*`). Download from  
+**[Releases](https://github.com/rendicott/marble-desktop-peer/releases)**.
+
+| Asset | Platform |
+|-------|----------|
+| `marble-peer-linux-amd64` | Linux x86_64 |
+| `marble-peer-linux-arm64` | Linux aarch64 |
+| `marble-peer-darwin-arm64` | macOS Apple Silicon |
 
 ```bash
-go build -o bin/marble-peer ./cmd/marble-peer
+chmod +x marble-peer-linux-amd64
+./marble-peer-linux-amd64 version
+sha256sum -c SHA256SUMS   # after downloading SHA256SUMS from the same release
 ```
 
-Requires Go 1.18+ (matches Marble). Linux screenshot uses `gnome-screenshot` (or ImageMagick `import`). Desktop click/type needs `xdotool` when available.
+### Linux runtime deps (recommended)
+
+| Tool | Purpose |
+|------|---------|
+| **Google Chrome** (or Chromium) | Browser automation via CDP mirror |
+| `xdotool` | Desktop click / type / key |
+| `gnome-screenshot` or ImageMagick `import` | Screenshots |
+
+```bash
+# Debian/Ubuntu examples
+sudo apt install xdotool gnome-screenshot
+# AppIndicator tray (Ubuntu often has this already):
+# sudo apt install gir1.2-ayatanaappindicator3-0.1
+```
+
+## Build from source
+
+```bash
+git clone https://github.com/rendicott/marble-desktop-peer.git
+cd marble-desktop-peer
+go build -o bin/marble-peer ./cmd/marble-peer
+./bin/marble-peer version
+```
+
+Requires **Go 1.18+** (CI release builds use **1.22.x**). Release binaries use `CGO_ENABLED=0` (no CGO required for the default Linux path).
+
+Optional ldflags (same as CI):
+
+```bash
+go build -ldflags "-s -w \
+  -X github.com/rendicott/marble-desktop-peer/internal/app.PeerVersion=v0.1.0 \
+  -X github.com/rendicott/marble-desktop-peer/internal/app.Commit=$(git rev-parse --short HEAD) \
+  -X github.com/rendicott/marble-desktop-peer/internal/app.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -o bin/marble-peer ./cmd/marble-peer
+```
 
 ## Your logged-in Chrome (default)
 
 **Chrome 136+ blocks remote debugging on the default profile path**
 (`~/.config/google-chrome`). Passing `--remote-debugging-port` there will start
-Chrome but **never open a CDP port** — that was the failure mode you hit.
+Chrome but **never open a CDP port**.
 
 Marble’s default **`browser_mode=user`** therefore:
 
@@ -31,11 +89,9 @@ Marble’s default **`browser_mode=user`** therefore:
 2. Launches **that mirror** with CDP on port **9222**
 3. Leaves your **daily Chrome** alone
 
-Sync + launch:
-
 ```bash
 marble-peer run
-# or from the agent: computer_browser_ensure  (force=true re-syncs + restarts mirror)
+# or from the harness agent: computer_browser_ensure  (force=true re-syncs + restarts mirror)
 ```
 
 Notes:
@@ -59,7 +115,7 @@ Notes:
 4. Run:
 
 ```bash
-export DISPLAY=:0   # if needed
+export DISPLAY=:0   # if needed (headless SSH without a seat will not work)
 ./bin/marble-peer run
 ```
 
@@ -67,7 +123,7 @@ Mini UI (status / confirm): `http://127.0.0.1:18765` (or next free port; see `~/
 
 ## Autostart + system tray (Linux)
 
-Starts at login via **systemd --user** (and a GNOME autostart desktop file as backup). Tray menu uses AppIndicator (needs `gir1.2-ayatanaappindicator3-0.1`, usually already on Ubuntu).
+Starts at login via **systemd --user** (and a GNOME autostart desktop file as backup).
 
 ```bash
 go build -o bin/marble-peer ./cmd/marble-peer
@@ -114,16 +170,49 @@ marble-peer uninstall-autostart   # disable + remove unit/desktop entry
 marble-peer run --no-tray         # foreground without tray
 ```
 
-## Design
+## CLI overview
 
-- Protocol: Marble `docs/peer-protocol.md`
-- System ADR: marble `adr/0020-marble-peer.md`
-- Peer ADR: marble `adr/0021-marble-desktop-peer.md` (copy to `adr/0001` when publishing this repo)
-- Ops / incident notes: [docs/idle-cpu-status-storm.md](docs/idle-cpu-status-storm.md)
-- Changelog: [CHANGELOG.md](CHANGELOG.md)
+| Command | Purpose |
+|---------|---------|
+| `marble-peer pair` | Complete mutual pairing with a harness H-code |
+| `marble-peer run` | Long-running daemon (WS + actions + optional tray) |
+| `marble-peer status` | Local JSON status + desktop availability |
+| `marble-peer unpair` | Clear local computer id + device token |
+| `marble-peer install-autostart` / `uninstall-autostart` | Linux user systemd + desktop entry |
+| `marble-peer version` | Print version (release builds inject tag/commit/date) |
+
+## Design & protocol
+
+| Doc | Location |
+|-----|----------|
+| Wire protocol | [Marble `docs/peer-protocol.md`](https://github.com/rendicott/marble/blob/main/docs/peer-protocol.md) |
+| System ADR | [Marble ADR-0020](https://github.com/rendicott/marble/blob/main/adr/0020-marble-peer.md) |
+| Peer implementation ADR | [`adr/0001-desktop-agent.md`](adr/0001-desktop-agent.md) (canonical copy of marble ADR-0021) |
+| Idle CPU incident | [docs/idle-cpu-status-storm.md](docs/idle-cpu-status-storm.md) |
+| Changelog | [CHANGELOG.md](CHANGELOG.md) |
 
 ## Security
 
-- Mini UI binds **127.0.0.1** only
-- Device token stored mode **0600** in `~/.marble-peer/credentials`
-- No cookie export; high-risk actions should use `computer_confirm`
+- Mini UI binds **127.0.0.1** only  
+- Device token stored mode **0600** in `~/.marble-peer/credentials`  
+- No cookie export; high-risk actions should use harness `computer_confirm`  
+- Do not commit `~/.marble-peer` or machine-specific harness URLs with secrets  
+
+## Releases (maintainers)
+
+GitHub Actions builds on tags `v*` (and `workflow_dispatch` re-run). Same pattern as [marble-harness](https://github.com/rendicott/marble).
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+# Workflow "Release" builds on ubuntu-latest, tests, attaches assets
+```
+
+If a tag exists but the workflow failed: **Actions → Release → Run workflow** → enter tag (e.g. `v0.1.0`).
+
+Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+## Related
+
+- Harness repo: https://github.com/rendicott/marble  
+- Issues / computer-use tools live primarily in the harness; peer bugs and OS packaging belong here.

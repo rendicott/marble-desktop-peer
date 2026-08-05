@@ -85,5 +85,13 @@ func uninstallWindows() ([]string, string, error) {
 	return []string{cmdPath}, "removed Startup entry", nil
 }
 
-// silence unused on non-linux when only darwin/windows built — linux stubs not needed
+// Stubs so autostart.go's runtime.GOOS switch links on non-linux targets.
+func installLinux(exe string, enable bool) ([]string, string, error) {
+	return nil, "", fmt.Errorf("not linux")
+}
+func uninstallLinux() ([]string, string, error) {
+	return nil, "", fmt.Errorf("not linux")
+}
+
+// silence unused
 var _ = runtime.GOOS

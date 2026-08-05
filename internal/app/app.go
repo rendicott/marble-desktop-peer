@@ -28,8 +28,6 @@ import (
 	"github.com/rendicott/marble-desktop-peer/internal/queue"
 )
 
-const PeerVersion = "0.1.0-dev"
-
 // App is the long-running peer daemon.
 type App struct {
 	Cfg     config.File

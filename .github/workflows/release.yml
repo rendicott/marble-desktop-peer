@@ -1,0 +1,133 @@
+# Build and publish marble-peer binaries on version tags (v*).
+# Builds run only on GitHub-hosted runners — do not upload local binaries.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Re-run a release build without retagging (uses the selected tag ref).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version tag
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "Tag must start with v (got: $TAG)" >&2
+              exit 1
+              ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.ver.outputs.tag }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build release binaries
+        env:
+          VERSION: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PKG="github.com/rendicott/marble-desktop-peer/internal/app"
+          LDFLAGS="-s -w -X ${PKG}.PeerVersion=${VERSION} -X ${PKG}.Commit=${COMMIT} -X ${PKG}.Date=${DATE}"
+
+          builds=(
+            "linux amd64"
+            "linux arm64"
+            "darwin arm64"
+          )
+
+          for spec in "${builds[@]}"; do
+            set -- $spec
+            GOOS="$1"
+            GOARCH="$2"
+            out="dist/marble-peer-${GOOS}-${GOARCH}"
+            echo "Building ${out}…"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags "$LDFLAGS" \
+              -o "$out" ./cmd/marble-peer
+            chmod +x "$out"
+          done
+
+          (
+            cd dist
+            sha256sum marble-peer-* > SHA256SUMS
+          )
+          ls -la dist
+          cat dist/SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: marble-peer ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/marble-peer-linux-amd64
+            dist/marble-peer-linux-arm64
+            dist/marble-peer-darwin-arm64
+            dist/SHA256SUMS
+          body: |
+            Pre-built **marble-peer** binaries built on **GitHub Actions** (`CGO_ENABLED=0`).
+
+            Desktop agent for [Marble](https://github.com/rendicott/marble) remote computer-use (ADR-0020 / ADR-0021).
+
+            | Asset | Platform |
+            |-------|----------|
+            | `marble-peer-linux-amd64` | Linux x86_64 |
+            | `marble-peer-linux-arm64` | Linux aarch64 |
+            | `marble-peer-darwin-arm64` | macOS Apple Silicon |
+
+            ```bash
+            chmod +x marble-peer-linux-amd64
+            ./marble-peer-linux-amd64 version
+            ./marble-peer-linux-amd64 -h   # if supported; else pair / run / status
+            ```
+
+            Verify:
+
+            ```bash
+            sha256sum -c SHA256SUMS
+            ```
+
+            **Linux desktop tools (recommended):** `xdotool`, `gnome-screenshot` (or ImageMagick `import`).  
+            **Chrome** required for browser automation (CDP mirror profile under `~/.marble-peer`).
+
+            See the [README](https://github.com/rendicott/marble-desktop-peer#readme) for pair, run, tray, and autostart.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

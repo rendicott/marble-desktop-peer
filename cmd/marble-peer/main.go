@@ -37,7 +37,7 @@ func main() {
 
 	switch cmd {
 	case "version", "-version", "--version":
-		fmt.Println("marble-peer", app.PeerVersion)
+		fmt.Println("marble-peer", app.VersionString())
 	case "pair":
 		fs := flag.NewFlagSet("pair", flag.ExitOnError)
 		harness := fs.String("harness", "", "Marble harness base URL")
