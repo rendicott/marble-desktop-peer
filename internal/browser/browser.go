@@ -1022,18 +1022,19 @@ func (m *Manager) Act(ctx context.Context, action, target, text string, x, y int
 		time.Sleep(400 * time.Millisecond)
 		mini := m.miniSnapshot(ctx)
 		return fmt.Sprintf("set_input_files ok files=%v selector=%q\npost:\n%s", paths, sel, mini), nil
-	case "click_text":
+	case "click_text", "click_button":
 		needle := text
 		if needle == "" {
 			needle = target
 		}
 		if strings.TrimSpace(needle) == "" {
-			return "", fmt.Errorf("click_text needs text=substring")
+			return "", fmt.Errorf("%s needs text=substring (button label)", action)
 		}
+		buttonsOnly := action == "click_button"
 		var hit string
 		err := m.withPage(ctx, func(s *cdpSession) error {
 			var e error
-			hit, e = cdpClickText(ctx, s, needle)
+			hit, e = cdpClickText(ctx, s, needle, buttonsOnly)
 			return e
 		})
 		if err != nil {
@@ -1042,7 +1043,7 @@ func (m *Manager) Act(ctx context.Context, action, target, text string, x, y int
 		time.Sleep(700 * time.Millisecond)
 		cur, _ := m.pageURL(ctx)
 		mini := m.miniSnapshot(ctx)
-		return "click_text hit=" + hit + " url=" + cur + "\npost:\n" + mini, nil
+		return action + " hit=" + hit + " url=" + cur + "\npost:\n" + mini, nil
 	case "click":
 		err := m.withPage(ctx, func(s *cdpSession) error {
 			_, _ = s.call(ctx, "Runtime.enable", nil)
@@ -1050,19 +1051,26 @@ func (m *Manager) Act(ctx context.Context, action, target, text string, x, y int
 			if strings.TrimSpace(target) != "" {
 				// If target doesn't look like CSS, treat as click_text
 				if !strings.ContainsAny(target, ".#[]>:=()") && !strings.HasPrefix(target, "text=") {
-					_, e := cdpClickText(ctx, s, target)
+					_, e := cdpClickText(ctx, s, target, false)
 					return e
 				}
 				if strings.HasPrefix(target, "text=") {
-					_, e := cdpClickText(ctx, s, strings.TrimPrefix(target, "text="))
+					_, e := cdpClickText(ctx, s, strings.TrimPrefix(target, "text="), false)
 					return e
 				}
+				if err := validateCSSSelector(target); err != nil {
+					return err
+				}
 				expr := fmt.Sprintf(`(function(){
-  const el = document.querySelector(%q);
-  if (!el) return 'not_found';
-  el.scrollIntoView({block:'center', inline:'center'});
-  el.click();
-  return 'ok';
+  try {
+    const el = document.querySelector(%q);
+    if (!el) return JSON.stringify({ok:false, reason:'not_found'});
+    el.scrollIntoView({block:'center', inline:'center'});
+    el.click();
+    return JSON.stringify({ok:true});
+  } catch (e) {
+    return JSON.stringify({ok:false, reason:String(e && e.message ? e.message : e)});
+  }
 })()`, target)
 				raw, err := s.call(ctx, "Runtime.evaluate", map[string]interface{}{
 					"expression":    expr,
@@ -1075,19 +1083,32 @@ func (m *Manager) Act(ctx context.Context, action, target, text string, x, y int
 					Result struct {
 						Value string `json:"value"`
 					} `json:"result"`
+					ExceptionDetails json.RawMessage `json:"exceptionDetails"`
 				}
 				_ = json.Unmarshal(raw, &res)
-				if res.Result.Value == "not_found" {
-					// fallback: click by text
-					if _, err := cdpClickText(ctx, s, target); err == nil {
-						return nil
+				if len(res.ExceptionDetails) > 0 && string(res.ExceptionDetails) != "null" {
+					return fmt.Errorf("invalid CSS selector %q (querySelector threw)", target)
+				}
+				var parsed struct {
+					OK     bool   `json:"ok"`
+					Reason string `json:"reason"`
+				}
+				if err := json.Unmarshal([]byte(res.Result.Value), &parsed); err != nil || res.Result.Value == "" {
+					return fmt.Errorf("CSS click failed for %q (empty/invalid evaluate result) — use click_text/click_button or a valid CSS selector", target)
+				}
+				if !parsed.OK {
+					if parsed.Reason == "not_found" {
+						if _, err := cdpClickText(ctx, s, target, true); err == nil {
+							return nil
+						}
+						return fmt.Errorf("selector not found: %s (also tried as click_button text)", target)
 					}
-					return fmt.Errorf("selector not found: %s (also tried as text)", target)
+					return fmt.Errorf("CSS click failed for %q: %s — jQuery pseudos like :contains are not supported; use click_button/click_text", target, parsed.Reason)
 				}
 				return nil
 			}
 			if x == 0 && y == 0 {
-				return fmt.Errorf("click needs target selector, click_text, or x,y")
+				return fmt.Errorf("click needs target selector, click_text, click_button, or x,y")
 			}
 			return cdpClick(ctx, s, float64(x), float64(y))
 		})
@@ -1188,7 +1209,7 @@ func (m *Manager) Act(ctx context.Context, action, target, text string, x, y int
 		})
 		return out, err
 	default:
-		return "", fmt.Errorf("unknown browser action %q (open|click|click_text|type|press|search_gmail|open_gmail|eval|wait|set_input_files)", action)
+		return "", fmt.Errorf("unknown browser action %q (open|click|click_text|click_button|type|press|search_gmail|open_gmail|eval|wait|set_input_files)", action)
 	}
 }
 
@@ -1676,55 +1697,101 @@ func (m *Manager) readOpenMessage(ctx context.Context) (string, error) {
 
 // cdpClickText finds a visible element containing needle and clicks it (Gmail rows, etc.).
 // Prefers the row element (tr.zA) over nested spans so Gmail opens the thread.
-func cdpClickText(ctx context.Context, s *cdpSession, needle string) (string, error) {
+// validateCSSSelector rejects jQuery-style and other non-CSS selector syntax.
+func validateCSSSelector(sel string) error {
+	low := strings.ToLower(sel)
+	if strings.Contains(low, ":contains") || strings.Contains(low, ":has(") ||
+		strings.Contains(low, ":eq(") || strings.Contains(low, ":gt(") ||
+		strings.Contains(low, ":lt(") || strings.Contains(low, ":first") ||
+		strings.Contains(low, ":last") || strings.Contains(sel, "$(") {
+		return fmt.Errorf("invalid CSS selector %q — jQuery pseudos (:contains, :has, …) are not supported; use action=click_button text=\"Label\" or a real CSS selector", sel)
+	}
+	return nil
+}
+
+// cdpClickText finds a visible control by label substring.
+// buttonsOnly=true restricts to button-like nodes (click_button); false allows Gmail rows + tight links.
+func cdpClickText(ctx context.Context, s *cdpSession, needle string, buttonsOnly bool) (string, error) {
 	_, _ = s.call(ctx, "Runtime.enable", nil)
 	_, _ = s.call(ctx, "Input.enable", map[string]interface{}{})
-	// Escape for JS string
 	b, _ := json.Marshal(needle)
+	mode, _ := json.Marshal(map[string]bool{"buttons_only": buttonsOnly})
 	expr := fmt.Sprintf(`(function(){
-  const needle = %s.toLowerCase();
-  // Prefer full rows first so we don't click nested chrome (star, important, etc.)
-  const preferred = Array.from(document.querySelectorAll(
-    'tr.zA, tr.zE, div[role="row"], div[data-legacy-thread-id], div[role="option"], div[role="link"], span.bog, div.xS, a'
-  ));
-  let best = null;
-  let bestScore = 1e9;
-  for (const el of preferred) {
-    const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')).replace(/\s+/g, ' ').trim();
-    if (!label) continue;
-    const idx = label.toLowerCase().indexOf(needle);
-    if (idx < 0) continue;
-    // prefer row-ish tags and shorter labels
-    let score = label.length + idx;
-    if (el.tagName === 'TR' || el.getAttribute('data-legacy-thread-id')) score -= 500;
-    if (score < bestScore) { bestScore = score; best = el; }
+  const needle = %s.toLowerCase().trim();
+  const mode = %s;
+  if (!needle) return JSON.stringify({ok:false, reason:'empty'});
+  const MAX_LABEL = 80;
+  const MAX_AREA = 120000;
+  const candidates = [];
+  function pushCand(el, label, kind, score) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) return;
+    if (r.bottom < 0 || r.right < 0 || r.top > (window.innerHeight||0) || r.left > (window.innerWidth||0)) return;
+    const area = r.width * r.height;
+    if (area > MAX_AREA) return;
+    if (label.length > MAX_LABEL) return;
+    // Reject nav shells: many children + long label
+    if (el.children && el.children.length > 8 && label.length > 40) return;
+    candidates.push({el, label, kind, score, area, r});
   }
-  if (!best) {
-    const all = Array.from(document.querySelectorAll('div,span,tr,td,a'));
-    for (const el of all) {
-      if (el.children && el.children.length > 8) continue;
-      const label = (el.innerText || '').replace(/\s+/g, ' ').trim();
-      if (label.length > 500 || label.length < needle.length) continue;
-      if (label.toLowerCase().includes(needle)) { best = el; break; }
+  function labelOf(el) {
+    return ((el.getAttribute('aria-label')||'') + ' ' + (el.innerText||el.value||'')).replace(/\s+/g,' ').trim();
+  }
+  // Pass 1: button-like controls
+  document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a').forEach(el => {
+    const label = labelOf(el);
+    if (!label || label.length < needle.length) return;
+    const low = label.toLowerCase();
+    const idx = low.indexOf(needle);
+    if (idx < 0) return;
+    let score = label.length + idx + (el.tagName === 'A' ? 30 : 0);
+    if (low === needle) score -= 1000;
+    else if (low.indexOf(needle) === 0) score -= 400;
+    pushCand(el, label, 'buttonish', score);
+  });
+  if (!mode.buttons_only) {
+    // Pass 2: Gmail / list rows
+    document.querySelectorAll('tr.zA, tr.zE, div[role="row"], div[data-legacy-thread-id], div[role="option"], div[role="link"], span.bog, div.xS').forEach(el => {
+      const label = labelOf(el);
+      if (!label) return;
+      const idx = label.toLowerCase().indexOf(needle);
+      if (idx < 0) return;
+      if (label.length > 240) return;
+      let score = Math.min(label.length, 200) + idx - 500;
+      pushCand(el, label.slice(0,160), 'row', score);
+    });
+  }
+  if (!candidates.length) {
+    return JSON.stringify({ok:false, reason:'not_found', needle:needle});
+  }
+  candidates.sort((a,b) => a.score - b.score || a.area - b.area);
+  // Ambiguous: two close top scores with different labels
+  if (candidates.length >= 2) {
+    const a = candidates[0], b = candidates[1];
+    if (Math.abs(a.score - b.score) < 40 && a.label.toLowerCase() !== b.label.toLowerCase()) {
+      return JSON.stringify({
+        ok:false, reason:'ambiguous',
+        candidates: candidates.slice(0,5).map(c => ({preview:c.label.slice(0,80), tag:c.el.tagName, kind:c.kind}))
+      });
     }
   }
-  if (!best) return 'not_found';
-  // climb to row if we hit a nested subject span
-  let clickEl = best;
+  let best = candidates[0].el;
   const row = best.closest && best.closest('tr.zA, tr.zE, div[role="row"], div[data-legacy-thread-id]');
-  if (row) clickEl = row;
-  clickEl.scrollIntoView({block:'center', inline:'center'});
-  const r = clickEl.getBoundingClientRect();
-  // click toward the subject (avoid left star/checkbox column)
-  const cx = r.left + Math.min(Math.max(r.width * 0.35, 80), r.width - 20);
+  if (row && !mode.buttons_only) best = row;
+  best.scrollIntoView({block:'center', inline:'center'});
+  const r = best.getBoundingClientRect();
+  const cx = r.left + Math.min(Math.max(r.width * 0.5, 8), r.width - 8);
   const cy = r.top + r.height/2;
-  clickEl.click();
+  best.click();
   for (const type of ['mousedown','mouseup','click']) {
-    clickEl.dispatchEvent(new MouseEvent(type, {bubbles:true, cancelable:true, clientX:cx, clientY:cy, view:window}));
+    best.dispatchEvent(new MouseEvent(type, {bubbles:true, cancelable:true, clientX:cx, clientY:cy, view:window}));
   }
-  const tid = clickEl.getAttribute('data-legacy-thread-id') || '';
-  return JSON.stringify({ok:true, cx:cx, cy:cy, tag:clickEl.tagName, thread_id:tid, preview:(clickEl.innerText||'').replace(/\s+/g,' ').trim().slice(0,160)});
-})()`, string(b))
+  const tid = best.getAttribute('data-legacy-thread-id') || '';
+  return JSON.stringify({
+    ok:true, cx:cx, cy:cy, tag:best.tagName, thread_id:tid,
+    preview:(best.innerText||best.value||'').replace(/\s+/g,' ').trim().slice(0,160)
+  });
+})()`, string(b), string(mode))
 	raw, err := s.call(ctx, "Runtime.evaluate", map[string]interface{}{
 		"expression":    expr,
 		"returnByValue": true,
@@ -1738,17 +1805,42 @@ func cdpClickText(ctx context.Context, s *cdpSession, needle string) (string, er
 		} `json:"result"`
 	}
 	_ = json.Unmarshal(raw, &res)
-	if res.Result.Value == "not_found" || res.Result.Value == "" {
+	if res.Result.Value == "" {
 		return "", fmt.Errorf("no visible element containing %q", needle)
 	}
-	// If we got coordinates, also do CDP mouse click for reliability
-	var hit struct {
-		OK bool    `json:"ok"`
-		CX float64 `json:"cx"`
-		CY float64 `json:"cy"`
+	var parsed struct {
+		OK         bool   `json:"ok"`
+		Reason     string `json:"reason"`
+		CX         float64 `json:"cx"`
+		CY         float64 `json:"cy"`
+		Candidates []struct {
+			Preview string `json:"preview"`
+			Tag     string `json:"tag"`
+			Kind    string `json:"kind"`
+		} `json:"candidates"`
 	}
-	if json.Unmarshal([]byte(res.Result.Value), &hit) == nil && hit.OK && hit.CX > 0 {
-		_ = cdpClick(ctx, s, hit.CX, hit.CY)
+	if err := json.Unmarshal([]byte(res.Result.Value), &parsed); err != nil {
+		if res.Result.Value == "not_found" {
+			return "", fmt.Errorf("no visible element containing %q", needle)
+		}
+		return "", fmt.Errorf("click_text parse failed for %q", needle)
+	}
+	if !parsed.OK {
+		if parsed.Reason == "ambiguous" {
+			var bits []string
+			for _, c := range parsed.Candidates {
+				bits = append(bits, fmt.Sprintf("%s[%s]", c.Tag, c.Preview))
+			}
+			return "", fmt.Errorf("ambiguous label %q — candidates: %s; use a more specific text or click_button", needle, strings.Join(bits, " | "))
+		}
+		kind := "element"
+		if buttonsOnly {
+			kind = "button"
+		}
+		return "", fmt.Errorf("no visible %s containing %q", kind, needle)
+	}
+	if parsed.CX > 0 {
+		_ = cdpClick(ctx, s, parsed.CX, parsed.CY)
 	}
 	time.Sleep(600 * time.Millisecond)
 	return res.Result.Value, nil

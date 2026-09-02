@@ -1,6 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed / Improved (computer-use reliability)
+- **`click_text` / `click_button`:** prefer real buttons/links; reject huge nav-shell DIVs; return `ambiguous` instead of clicking the wrong container
+- **CSS `click`:** reject jQuery `:contains` and other invalid selectors; never silent-success on empty evaluate
+- **Screenshots:** max edge 1280 JPEG; meta includes `screen_w`/`screen_h`/`scale`; last-click crosshair overlay
+- **`desktop_click`:** image-space coords mapped to screen; atomic post-click screenshot in the same queue slot (no `peer busy`); no Chrome raise-on-click; log active window title
+
 ## [v0.1.0] — 2026-08-05
+
 
 First public release of **marble-peer** (desktop agent for [Marble](https://github.com/rendicott/marble)).
 

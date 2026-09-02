@@ -58,6 +58,7 @@ type ConfirmRequest struct {
 	URL       string    `json:"url"`
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+	NotifID   uint32    `json:"-"` // desktop notification id (withdraw on resolve)
 }
 
 func New(cfg config.File, token string) *App {
@@ -307,10 +308,9 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 			return protocol.Envelope{OK: false, Error: err.Error()}
 		}
 		ls := desktop.QueryLockState(ctx)
-		m := map[string]interface{}{
-			"w": meta.W, "h": meta.H, "scale": meta.Scale,
+		m := desktop.MetaMap(meta, map[string]interface{}{
 			"locked": ls.Locked, "lock_source": ls.Source,
-		}
+		})
 		text := ""
 		if ls.Locked {
 			text = desktop.FormatLockWarning(ls)
@@ -328,7 +328,28 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		if err := desktop.Click(ctx, x, y, btn); err != nil {
 			return protocol.Envelope{OK: false, Error: err.Error()}
 		}
-		return protocol.Envelope{OK: true, Text: fmt.Sprintf("clicked (%d,%d) button=%s", x, y, btn)}
+		// Atomic post-click screenshot in the same queue slot (avoids "peer busy").
+		img, meta, shotErr := desktop.Screenshot(ctx)
+		sx, sy := desktop.ImageToScreen(meta, x, y)
+		text := fmt.Sprintf("clicked image=(%d,%d) screen=(%d,%d) button=%s", x, y, sx, sy, btn)
+		envOut := protocol.Envelope{OK: true, Text: text}
+		if shotErr == nil {
+			ls := desktop.QueryLockState(ctx)
+			envOut.ScreenshotB64 = base64.StdEncoding.EncodeToString(img)
+			envOut.Meta = desktop.MetaMap(meta, map[string]interface{}{
+				"locked": ls.Locked, "lock_source": ls.Source,
+				"last_click": map[string]int{"x": x, "y": y},
+			})
+			if ls.Locked {
+				envOut.Text = text + "\n" + desktop.FormatLockWarning(ls)
+			}
+		} else {
+			envOut.Meta = map[string]interface{}{
+				"post_click_screenshot_error": shotErr.Error(),
+				"last_click":                  map[string]int{"x": x, "y": y},
+			}
+		}
+		return envOut
 	case "desktop_type":
 		text, _ := payload["text"].(string)
 		if err := desktop.Type(ctx, text); err != nil {
@@ -399,7 +420,8 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 	case "confirm":
 		prompt, _ := payload["prompt"].(string)
 		risk, _ := payload["risk"].(string)
-		ok, detail := a.waitConfirm(ctx, env.ID, prompt, risk)
+		harnessURL, _ := payload["harness_url"].(string)
+		ok, detail := a.waitConfirm(ctx, env.ID, prompt, risk, harnessURL)
 		return protocol.Envelope{Type: "confirm_result", ID: env.ID, OK: ok, Text: detail}
 	default:
 		return protocol.Envelope{OK: false, Error: "unknown kind " + env.Kind}
@@ -469,7 +491,7 @@ func asButton(v interface{}) string {
 	}
 }
 
-func (a *App) waitConfirm(ctx context.Context, id, prompt, risk string) (accepted bool, detail string) {
+func (a *App) waitConfirm(ctx context.Context, id, prompt, risk, harnessURL string) (accepted bool, detail string) {
 	if id == "" {
 		id = uuid.NewString()
 	}
@@ -480,29 +502,37 @@ func (a *App) waitConfirm(ctx context.Context, id, prompt, risk string) (accepte
 		risk = "high"
 	}
 	base := a.miniUIBase()
-	confirmURL := strings.TrimRight(base, "/") + "/confirm/" + id
+	localURL := strings.TrimRight(base, "/") + "/confirm/" + id
+	// Prefer harness URL (Tailscale-reachable). Peer mini-UI is loopback-only.
+	confirmURL := strings.TrimSpace(harnessURL)
+	if confirmURL == "" {
+		confirmURL = localURL
+	}
 	expires := time.Now().Add(120 * time.Second)
 
 	ch := make(chan bool, 1)
+	notifID := notifyConfirm(prompt, risk, confirmURL)
 	a.confirmMu.Lock()
 	a.confirmCh[id] = ch
 	a.confirmMeta[id] = ConfirmRequest{
 		ID: id, Prompt: prompt, Risk: risk, URL: confirmURL,
-		CreatedAt: time.Now(), ExpiresAt: expires,
+		CreatedAt: time.Now(), ExpiresAt: expires, NotifID: notifID,
 	}
 	a.confirmMu.Unlock()
 	defer func() {
 		a.confirmMu.Lock()
+		meta := a.confirmMeta[id]
 		delete(a.confirmCh, id)
 		delete(a.confirmMeta, id)
 		a.confirmMu.Unlock()
+		// Withdraw desktop toast so it cannot linger as a zombie after timeout/resolve.
+		if meta.NotifID != 0 {
+			closeDesktopNotification(meta.NotifID)
+		}
 	}()
 
-	log.Printf("CONFIRM required id=%s risk=%s url=%s prompt=%s", id, risk, confirmURL, prompt)
+	log.Printf("CONFIRM required id=%s risk=%s url=%s local=%s notif=%d prompt=%s", id, risk, confirmURL, localURL, notifID, prompt)
 	fmt.Fprintf(os.Stderr, "\n*** CONFIRM (%s) — open this URL and click Accept or Deny (120s):\n    %s\n    prompt: %s\n\n", risk, confirmURL, prompt)
-
-	// Surface on the operator's desktop (best-effort).
-	go notifyConfirm(prompt, risk, confirmURL)
 
 	select {
 	case v := <-ch:
@@ -567,25 +597,70 @@ func (a *App) ResolveConfirm(id string, accept bool) bool {
 }
 
 // notifyConfirm shows a desktop notification and opens the confirm page in a browser.
-func notifyConfirm(prompt, risk, confirmURL string) {
-	// notify-send (GNOME)
-	if _, err := exec.LookPath("notify-send"); err == nil {
-		title := "Marble Peer — confirmation required"
-		if risk != "" {
-			title += " (" + risk + ")"
-		}
-		body := prompt
-		if len(body) > 180 {
-			body = body[:180] + "…"
-		}
-		body += "\nOpen: " + confirmURL
-		_ = exec.Command("notify-send", "-u", "critical", "-t", "120000",
-			"--app-name=marble-peer", title, body).Start()
+// Returns the freedesktop notification id (0 if unknown) so callers can withdraw it.
+func notifyConfirm(prompt, risk, confirmURL string) uint32 {
+	title := "Marble Peer — confirmation required"
+	if risk != "" {
+		title += " (" + risk + ")"
 	}
-	// Open the Accept/Deny page
+	body := prompt
+	if len(body) > 180 {
+		body = body[:180] + "…"
+	}
+	body += "\nOpen: " + confirmURL
+
+	var notifID uint32
+	// Prefer gdbus Notify so we get an id we can CloseNotification later.
+	// Critical+sticky toasts otherwise linger in GNOME long after the confirm is gone —
+	// which looks like a harness card should exist when pending_confirms is empty.
+	if _, err := exec.LookPath("gdbus"); err == nil {
+		out, err := exec.Command("gdbus", "call", "--session",
+			"--dest", "org.freedesktop.Notifications",
+			"--object-path", "/org/freedesktop/Notifications",
+			"--method", "org.freedesktop.Notifications.Notify",
+			"marble-peer", "0", "", title, body,
+			"[]", `{"urgency": <byte 1>, "transient": <true>}`, "int32 120000",
+		).CombinedOutput()
+		if err == nil {
+			// Returns like: (uint32 42,)
+			s := strings.TrimSpace(string(out))
+			if i := strings.Index(s, "uint32 "); i >= 0 {
+				var n uint32
+				if _, err := fmt.Sscanf(s[i:], "uint32 %d", &n); err == nil {
+					notifID = n
+				}
+			}
+		} else {
+			log.Printf("notify Confirm gdbus: %v: %s", err, strings.TrimSpace(string(out)))
+		}
+	}
+	if notifID == 0 {
+		if _, err := exec.LookPath("notify-send"); err == nil {
+			// normal urgency + expire; avoid critical (sticks in notification shade)
+			_ = exec.Command("notify-send", "-u", "normal", "-t", "120000",
+				"--app-name=marble-peer", "--hint=int:transient:1", title, body).Start()
+		}
+	}
+	// Open the Accept/Deny page (harness URL preferred by caller)
 	if _, err := exec.LookPath("xdg-open"); err == nil {
 		_ = exec.Command("xdg-open", confirmURL).Start()
 	}
+	return notifID
+}
+
+func closeDesktopNotification(id uint32) {
+	if id == 0 {
+		return
+	}
+	if _, err := exec.LookPath("gdbus"); err != nil {
+		return
+	}
+	_ = exec.Command("gdbus", "call", "--session",
+		"--dest", "org.freedesktop.Notifications",
+		"--object-path", "/org/freedesktop/Notifications",
+		"--method", "org.freedesktop.Notifications.CloseNotification",
+		strconv.FormatUint(uint64(id), 10),
+	).Run()
 }
 
 func wsURL(harness, deviceID, token string) (string, error) {

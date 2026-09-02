@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
 	"image/jpeg"
 	_ "image/png"
 	"os"
@@ -19,16 +21,23 @@ import (
 	"time"
 )
 
-// ScreenMeta describes the primary display capture.
+// MaxScreenshotEdge is the max JPEG edge sent to the harness/model (ADR-0020).
+// Clicks use image pixel space; peer maps to screen via ScreenW/ScreenH.
+const MaxScreenshotEdge = 1280
+
+// ScreenMeta describes the primary display capture (possibly downscaled for transport).
 type ScreenMeta struct {
-	W     int     `json:"w"`
-	H     int     `json:"h"`
-	Scale float64 `json:"scale"`
+	W       int     `json:"w"`                 // JPEG / image width (model click space)
+	H       int     `json:"h"`                 // JPEG / image height
+	Scale   float64 `json:"scale"`             // screenW / imageW (1 if unscaled)
+	ScreenW int     `json:"screen_w,omitempty"` // full capture width before scale
+	ScreenH int     `json:"screen_h,omitempty"` // full capture height before scale
 }
 
 var (
-	screenMu   sync.Mutex
-	lastScreen ScreenMeta
+	screenMu     sync.Mutex
+	lastScreen   ScreenMeta
+	lastClickImg struct{ X, Y int; Set bool } // image-space coords for overlay
 )
 
 // LastScreen returns dimensions from the most recent Screenshot (if any).
@@ -36,6 +45,42 @@ func LastScreen() ScreenMeta {
 	screenMu.Lock()
 	defer screenMu.Unlock()
 	return lastScreen
+}
+
+// MetaMap returns JSON-friendly screenshot metadata for the protocol envelope.
+func MetaMap(meta ScreenMeta, extra map[string]interface{}) map[string]interface{} {
+	m := map[string]interface{}{
+		"w": meta.W, "h": meta.H, "scale": meta.Scale,
+		"screen_w": meta.ScreenW, "screen_h": meta.ScreenH,
+	}
+	for k, v := range extra {
+		m[k] = v
+	}
+	return m
+}
+
+// SetLastClickImage records the last click in image pixel space (for crosshair overlay).
+func SetLastClickImage(x, y int) {
+	screenMu.Lock()
+	lastClickImg.X, lastClickImg.Y, lastClickImg.Set = x, y, true
+	screenMu.Unlock()
+}
+
+// ImageToScreen maps image-space click coords to physical screen pixels.
+func ImageToScreen(meta ScreenMeta, ix, iy int) (sx, sy int) {
+	sw, sh := meta.ScreenW, meta.ScreenH
+	if sw <= 0 {
+		sw = meta.W
+	}
+	if sh <= 0 {
+		sh = meta.H
+	}
+	if meta.W <= 0 || meta.H <= 0 {
+		return ix, iy
+	}
+	sx = ix * sw / meta.W
+	sy = iy * sh / meta.H
+	return sx, sy
 }
 
 // Screenshot captures the primary display as JPEG bytes.
@@ -92,18 +137,107 @@ func encodeShot(path string) ([]byte, ScreenMeta, error) {
 		return raw, ScreenMeta{}, rerr
 	}
 	b := img.Bounds()
-	meta := ScreenMeta{W: b.Dx(), H: b.Dy(), Scale: 1}
-	if meta.W <= 0 || meta.H <= 0 {
-		return nil, meta, fmt.Errorf("screenshot decoded with empty bounds")
+	screenW, screenH := b.Dx(), b.Dy()
+	if screenW <= 0 || screenH <= 0 {
+		return nil, ScreenMeta{}, fmt.Errorf("screenshot decoded with empty bounds")
+	}
+
+	scaled := img
+	imgW, imgH := screenW, screenH
+	scale := 1.0
+	if max(screenW, screenH) > MaxScreenshotEdge {
+		if screenW >= screenH {
+			imgW = MaxScreenshotEdge
+			imgH = screenH * MaxScreenshotEdge / screenW
+		} else {
+			imgH = MaxScreenshotEdge
+			imgW = screenW * MaxScreenshotEdge / screenH
+		}
+		if imgW < 1 {
+			imgW = 1
+		}
+		if imgH < 1 {
+			imgH = 1
+		}
+		scale = float64(screenW) / float64(imgW)
+		scaled = resizeNearest(img, imgW, imgH)
+	}
+
+	// Draw last-click crosshair in image space (helps vision see misses).
+	screenMu.Lock()
+	lcX, lcY, lcSet := lastClickImg.X, lastClickImg.Y, lastClickImg.Set
+	screenMu.Unlock()
+	if lcSet {
+		scaled = drawCrosshair(scaled, lcX, lcY)
+	}
+
+	meta := ScreenMeta{
+		W: imgW, H: imgH, Scale: scale,
+		ScreenW: screenW, ScreenH: screenH,
 	}
 	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err != nil {
+	if err := jpeg.Encode(&buf, scaled, &jpeg.Options{Quality: 80}); err != nil {
 		return nil, meta, err
 	}
 	screenMu.Lock()
 	lastScreen = meta
 	screenMu.Unlock()
 	return buf.Bytes(), meta, nil
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func resizeNearest(src image.Image, tw, th int) image.Image {
+	dst := image.NewRGBA(image.Rect(0, 0, tw, th))
+	sb := src.Bounds()
+	sw, sh := sb.Dx(), sb.Dy()
+	for y := 0; y < th; y++ {
+		sy := sb.Min.Y + y*sh/th
+		for x := 0; x < tw; x++ {
+			sx := sb.Min.X + x*sw/tw
+			dst.Set(x, y, src.At(sx, sy))
+		}
+	}
+	return dst
+}
+
+func drawCrosshair(src image.Image, cx, cy int) image.Image {
+	b := src.Bounds()
+	dst := image.NewRGBA(b)
+	draw.Draw(dst, b, src, b.Min, draw.Src)
+	if cx < b.Min.X || cy < b.Min.Y || cx >= b.Max.X || cy >= b.Max.Y {
+		return dst
+	}
+	col := color.RGBA{R: 255, G: 40, B: 40, A: 255}
+	const arm = 14
+	const thick = 2
+	for dx := -arm; dx <= arm; dx++ {
+		for t := -thick / 2; t <= thick/2; t++ {
+			x, y := cx+dx, cy+t
+			if x >= b.Min.X && x < b.Max.X && y >= b.Min.Y && y < b.Max.Y {
+				dst.Set(x, y, col)
+			}
+			x, y = cx+t, cy+dx
+			if x >= b.Min.X && x < b.Max.X && y >= b.Min.Y && y < b.Max.Y {
+				dst.Set(x, y, col)
+			}
+		}
+	}
+	// small ring
+	for _, d := range []int{-6, -5, 5, 6} {
+		for _, e := range []int{-6, -5, 5, 6} {
+			x, y := cx+d, cy+e
+			if x >= b.Min.X && x < b.Max.X && y >= b.Min.Y && y < b.Max.Y {
+				dst.Set(x, y, col)
+			}
+		}
+	}
+	return dst
 }
 
 func findXdotool() (string, error) {
@@ -141,61 +275,84 @@ func normalizeButton(button string) string {
 	}
 }
 
-// Click moves and clicks at screen coordinates using several strategies.
-// Empty button is forced to "1" (empty string causes XTest BadValue).
+// Click moves and clicks. Coordinates are in **screenshot image space** (meta.w×meta.h).
+// Peer maps to physical screen pixels. Empty button is forced to "1".
+// Does not raise Chrome — absolute coords should hit whatever is under the pixel.
 func Click(ctx context.Context, x, y int, button string) error {
 	button = normalizeButton(button)
 	if x < 0 || y < 0 {
 		return fmt.Errorf("invalid click coordinates (%d,%d)", x, y)
 	}
-	// (0,0) is often a mapping bug; allow only if screenshot says 0 is valid (never)
 	if x == 0 && y == 0 {
 		return fmt.Errorf("invalid click coordinates (0,0) — take computer_screenshot first and click from visible UI coords")
 	}
-	if meta := LastScreen(); meta.W > 0 && meta.H > 0 {
+	meta := LastScreen()
+	if meta.W > 0 && meta.H > 0 {
 		if x >= meta.W || y >= meta.H {
-			return fmt.Errorf("click (%d,%d) outside last screenshot %dx%d — re-screenshot and remap", x, y, meta.W, meta.H)
+			return fmt.Errorf("click (%d,%d) outside last screenshot image %dx%d (screen %dx%d scale=%.2f) — re-screenshot and remap in image space",
+				x, y, meta.W, meta.H, meta.ScreenW, meta.ScreenH, meta.Scale)
 		}
 	}
+	sx, sy := ImageToScreen(meta, x, y)
+	SetLastClickImage(x, y)
 
 	xd, err := findXdotool()
 	if err != nil {
-		// Try ydotool without xdotool
-		if err2 := clickYdotool(ctx, x, y, button); err2 == nil {
+		if err2 := clickYdotool(ctx, sx, sy, button); err2 == nil {
+			logActiveWindow(ctx, "")
 			return nil
 		}
 		return fmt.Errorf("%v (and ydotool unavailable)", err)
 	}
 
-	_ = raiseUsefulWindow(ctx, xd)
+	// No raiseUsefulWindow on click — absolute coords; raising steals focus incorrectly.
 
 	var errs []string
-	// Strategy 1: absolute mousemove + click
-	if err := xdotoolMoveClick(ctx, xd, x, y, button, false); err == nil {
+	if err := xdotoolMoveClick(ctx, xd, sx, sy, button, false); err == nil {
+		logActiveWindow(ctx, xd)
 		return nil
 	} else {
 		errs = append(errs, "mousemove+click: "+err.Error())
 	}
-	// Strategy 2: mousemove + mousedown/mouseup
-	if err := xdotoolMoveDownUp(ctx, xd, x, y, button); err == nil {
+	if err := xdotoolMoveDownUp(ctx, xd, sx, sy, button); err == nil {
+		logActiveWindow(ctx, xd)
 		return nil
 	} else {
 		errs = append(errs, "mousedown/up: "+err.Error())
 	}
-	// Strategy 3: click on active window using absolute coords after activate
-	if err := xdotoolMoveClick(ctx, xd, x, y, button, true); err == nil {
+	if err := xdotoolMoveClick(ctx, xd, sx, sy, button, true); err == nil {
+		logActiveWindow(ctx, xd)
 		return nil
 	} else {
 		errs = append(errs, "clearmod click: "+err.Error())
 	}
-	// Strategy 4: ydotool (uinput) if present
-	if err := clickYdotool(ctx, x, y, button); err == nil {
+	if err := clickYdotool(ctx, sx, sy, button); err == nil {
+		logActiveWindow(ctx, xd)
 		return nil
 	} else if !strings.Contains(err.Error(), "not found") {
 		errs = append(errs, "ydotool: "+err.Error())
 	}
 
-	return fmt.Errorf("desktop click failed after %d strategies: %s", len(errs), strings.Join(errs, " | "))
+	return fmt.Errorf("desktop click failed after %d strategies (image=%d,%d screen=%d,%d): %s",
+		len(errs), x, y, sx, sy, strings.Join(errs, " | "))
+}
+
+func logActiveWindow(ctx context.Context, xd string) {
+	if xd == "" {
+		var err error
+		xd, err = findXdotool()
+		if err != nil {
+			return
+		}
+	}
+	cmd := exec.CommandContext(ctx, xd, "getactivewindow", "getwindowname")
+	ensureDisplay(cmd)
+	out, err := cmd.CombinedOutput()
+	name := strings.TrimSpace(string(out))
+	if err != nil || name == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "marble-peer desktop: active window after click: %s\n", name)
 }
 
 func xdotoolMoveClick(ctx context.Context, xd string, x, y int, button string, clear bool) error {
