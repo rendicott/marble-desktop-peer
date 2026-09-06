@@ -188,15 +188,13 @@ jobs:
             | `marble-peer-darwin-amd64` | macOS Intel |
 
             ```bash
+            curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/marble-peer-darwin-arm64
+            curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/SHA256SUMS
+            grep marble-peer-darwin-arm64 SHA256SUMS | shasum -a 256 -c -
             chmod +x marble-peer-darwin-arm64
+            xattr -d com.apple.quarantine marble-peer-darwin-arm64
             ./marble-peer-darwin-arm64 version
             ./marble-peer-darwin-arm64 doctor
-            ```
-
-            Verify:
-
-            ```bash
-            sha256sum -c SHA256SUMS
             ```
 
             **Linux desktop tools (recommended):** `xdotool`, `gnome-screenshot` (or ImageMagick `import`).

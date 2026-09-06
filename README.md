@@ -37,13 +37,20 @@ There is **no `.dmg`**, Homebrew formula, or App Store build. GitHub Actions pub
 
 Needs **Google Chrome** in `/Applications`. No other packages. Optional: [Xcode Command Line Tools](https://developer.apple.com/download/all/) (`xcode-select --install`) so the first click/type can compile a small Swift helper (`swiftc`). Built-in `screencapture`, `osascript`, and `caffeinate` are enough for doctor + screenshots.
 
-**1. Download** `marble-peer-darwin-arm64` (Apple Silicon) or `marble-peer-darwin-amd64` (Intel), plus `SHA256SUMS`, from the [latest release](https://github.com/rendicott/marble-desktop-peer/releases/latest).
-
-**2. Verify, clear Gatekeeper quarantine, install to a stable path.** LaunchAgent records the binary’s real path, so do **not** leave it in `~/Downloads`.
+**1. Download the binary and `SHA256SUMS`.** The release page’s download button only fetches one file; checksums are a **second** asset. From a terminal (Apple Silicon):
 
 ```bash
 cd ~/Downloads
+curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/marble-peer-darwin-arm64
+curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/SHA256SUMS
 grep marble-peer-darwin-arm64 SHA256SUMS | shasum -a 256 -c -
+```
+
+Intel: replace `darwin-arm64` with `darwin-amd64` in both the `curl` and `grep` lines. With GitHub CLI: `gh release download --repo rendicott/marble-desktop-peer --pattern 'marble-peer-darwin-arm64' --pattern SHA256SUMS`.
+
+**2. Clear Gatekeeper quarantine and install to a stable path.** LaunchAgent records the binary’s real path, so do **not** leave it in `~/Downloads`.
+
+```bash
 chmod +x marble-peer-darwin-arm64
 # Unsigned GitHub download — otherwise macOS says the developer cannot be verified:
 xattr -d com.apple.quarantine marble-peer-darwin-arm64
@@ -53,8 +60,6 @@ mkdir -p ~/.local/bin
 mv marble-peer-darwin-arm64 ~/.local/bin/marble-peer
 export PATH="$HOME/.local/bin:$PATH"   # add this line to ~/.zshrc to keep it
 ```
-
-Intel: same steps with `marble-peer-darwin-amd64`.
 
 **3. Probe the machine** (tools, Chrome, screenshot, TCC):
 
@@ -100,9 +105,10 @@ marble-peer uninstall-autostart
 ### Linux
 
 ```bash
+curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/marble-peer-linux-amd64
+curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/SHA256SUMS
+grep marble-peer-linux-amd64 SHA256SUMS | sha256sum -c -
 chmod +x marble-peer-linux-amd64
-./marble-peer-linux-amd64 version
-sha256sum -c SHA256SUMS   # after downloading SHA256SUMS from the same release
 mkdir -p ~/.local/bin
 mv marble-peer-linux-amd64 ~/.local/bin/marble-peer
 ```
