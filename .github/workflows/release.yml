@@ -192,7 +192,7 @@ jobs:
             curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/SHA256SUMS
             grep marble-peer-darwin-arm64 SHA256SUMS | shasum -a 256 -c -
             chmod +x marble-peer-darwin-arm64
-            xattr -d com.apple.quarantine marble-peer-darwin-arm64
+            xattr -d com.apple.quarantine marble-peer-darwin-arm64 2>/dev/null || true
             ./marble-peer-darwin-arm64 version
             ./marble-peer-darwin-arm64 doctor
             ```

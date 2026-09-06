@@ -37,38 +37,32 @@ There is **no `.dmg`**, Homebrew formula, or App Store build. GitHub Actions pub
 
 Needs **Google Chrome** in `/Applications`. No other packages. Optional: [Xcode Command Line Tools](https://developer.apple.com/download/all/) (`xcode-select --install`) so the first click/type can compile a small Swift helper (`swiftc`). Built-in `screencapture`, `osascript`, and `caffeinate` are enough for doctor + screenshots.
 
-**1. Download the binary and `SHA256SUMS`.** The release page’s download button only fetches one file; checksums are a **second** asset. From a terminal (Apple Silicon):
+**1. Download, verify, and install** (Apple Silicon). Paste this whole block — it has no `#` comments (zsh treats those as commands unless `interactivecomments` is on). `SHA256SUMS` is a **separate** release asset from the binary. LaunchAgent records the binary’s real path, so do **not** leave it in `~/Downloads`.
 
 ```bash
 cd ~/Downloads
 curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/marble-peer-darwin-arm64
 curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/SHA256SUMS
 grep marble-peer-darwin-arm64 SHA256SUMS | shasum -a 256 -c -
-```
-
-Intel: replace `darwin-arm64` with `darwin-amd64` in both the `curl` and `grep` lines. With GitHub CLI: `gh release download --repo rendicott/marble-desktop-peer --pattern 'marble-peer-darwin-arm64' --pattern SHA256SUMS`.
-
-**2. Clear Gatekeeper quarantine and install to a stable path.** LaunchAgent records the binary’s real path, so do **not** leave it in `~/Downloads`.
-
-```bash
 chmod +x marble-peer-darwin-arm64
-# Unsigned GitHub download — otherwise macOS says the developer cannot be verified:
-xattr -d com.apple.quarantine marble-peer-darwin-arm64
-# Alternative: Finder → right-click the binary → Open → Open
-
+xattr -d com.apple.quarantine marble-peer-darwin-arm64 2>/dev/null || true
 mkdir -p ~/.local/bin
-mv marble-peer-darwin-arm64 ~/.local/bin/marble-peer
-export PATH="$HOME/.local/bin:$PATH"   # add this line to ~/.zshrc to keep it
+mv -f marble-peer-darwin-arm64 ~/.local/bin/marble-peer
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-**3. Probe the machine** (tools, Chrome, screenshot, TCC):
+Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` so it survives new terminals. If Gatekeeper still blocks the binary: Finder → right-click `~/.local/bin/marble-peer` → Open.
+
+Intel: replace `darwin-arm64` with `darwin-amd64` in the `curl` and `grep` lines. With GitHub CLI: `gh release download --repo rendicott/marble-desktop-peer --pattern 'marble-peer-darwin-arm64' --pattern SHA256SUMS`.
+
+**2. Probe the machine** (tools, Chrome, screenshot, TCC):
 
 ```bash
 marble-peer version
 marble-peer doctor --open-settings
 ```
 
-**4. Grant permissions** to the app that *launches* marble-peer:
+**3. Grant permissions** to the app that *launches* marble-peer:
 
 | Setting | Why |
 |---------|-----|
@@ -81,14 +75,14 @@ marble-peer doctor --open-settings
 
 Unsigned rebuilds can drop off the list; re-grant if `doctor` reports screen/accessibility denied. Mini UI (`http://127.0.0.1:18765`) also has a permission banner.
 
-**5. Pair with Marble, then run** (see [Pair](#pair-mutual-handshake)):
+**4. Pair with Marble, then run** (see [Pair](#pair-mutual-handshake)):
 
 ```bash
 marble-peer pair --harness https://YOUR-HARNESS --code HXXXXX
 marble-peer run
 ```
 
-**6. Optional — start at login** (LaunchAgent `~/Library/LaunchAgents/com.rendicott.marble-peer.plist`):
+**5. Optional — start at login** (LaunchAgent `~/Library/LaunchAgents/com.rendicott.marble-peer.plist`):
 
 ```bash
 marble-peer install-autostart
