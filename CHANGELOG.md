@@ -11,7 +11,7 @@ First **functional macOS** peer. Darwin release assets are built on `macos-lates
 - **macOS Chrome:** `/Applications/Google Chrome.app` + `~/Library/Application Support/Google/Chrome` user-profile mirror (no Linux `--ozone-platform=x11`)
 - **`marble-peer doctor`:** local OS/Chrome/desktop/permission probe; `--open-settings` for TCC panes
 - Mini UI macOS permission banner + `POST /macos-perms`
-- CI on `macos-latest`; release builds `darwin/arm64` and `darwin/amd64` on a macOS runner
+- CI on `macos-latest`; release builds `darwin/arm64` and `darwin/amd64` on a macOS runner (Go **1.25.x** so Darwin test binaries include `LC_UUID` for current macOS dyld)
 
 ### Fixed / Improved (computer-use reliability)
 - **`click_text` / `click_button`:** prefer real buttons/links; reject huge nav-shell DIVs; return `ambiguous` instead of clicking the wrong container

@@ -510,7 +510,10 @@ func runDoctor(openSettings, requestPerms, doShot bool) int {
 	}
 
 	if !ok {
-		failed = true
+		fmt.Println("note: desktop tools not available on this machine — screenshot/click will fail until they are installed (or permissions granted).")
+		if doShot {
+			failed = true
+		}
 	}
 	if bin == "" {
 		fmt.Println("note: Chrome not found — browser automation will be unavailable until Google Chrome is installed.")

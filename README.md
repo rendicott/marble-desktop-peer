@@ -129,7 +129,7 @@ go build -o bin/marble-peer ./cmd/marble-peer
 ./bin/marble-peer version
 ```
 
-Requires **Go 1.18+** (CI release builds use **1.22.x**). Release binaries use `CGO_ENABLED=0` (no CGO; Linux uses shell tools, macOS compiles a Swift helper at first use).
+Requires **Go 1.18+** (CI release builds use **1.25.x**). Release binaries use `CGO_ENABLED=0` (no CGO; Linux uses shell tools, macOS compiles a Swift helper at first use).
 
 Optional ldflags (same as CI):
 
