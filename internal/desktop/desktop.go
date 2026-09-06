@@ -1,6 +1,7 @@
 // Package desktop provides OS-level screenshot and input for marble-peer.
-// On Ubuntu GNOME (often Wayland), X11 tools talk to XWayland (DISPLAY=:0).
-// We harden that path rather than telling agents to avoid desktop entirely.
+//
+// Linux: GNOME/XWayland tools (grim, gnome-screenshot, xdotool).
+// macOS: screencapture + a compiled Swift helper (CGEvent) for click/type/key.
 package desktop
 
 import (
@@ -27,17 +28,27 @@ const MaxScreenshotEdge = 1280
 
 // ScreenMeta describes the primary display capture (possibly downscaled for transport).
 type ScreenMeta struct {
-	W       int     `json:"w"`                 // JPEG / image width (model click space)
-	H       int     `json:"h"`                 // JPEG / image height
-	Scale   float64 `json:"scale"`             // screenW / imageW (1 if unscaled)
-	ScreenW int     `json:"screen_w,omitempty"` // full capture width before scale
-	ScreenH int     `json:"screen_h,omitempty"` // full capture height before scale
+	W       int     `json:"w"`                  // JPEG / image width (model click space)
+	H       int     `json:"h"`                  // JPEG / image height
+	Scale   float64 `json:"scale"`              // screenW / imageW (1 if unscaled)
+	ScreenW int     `json:"screen_w,omitempty"` // click-space width (physical or logical points)
+	ScreenH int     `json:"screen_h,omitempty"` // click-space height
+}
+
+// Perms is a best-effort macOS TCC snapshot. Other OSes report n/a.
+type Perms struct {
+	ScreenRecording string `json:"screen_recording"` // granted|denied|unknown|n/a
+	Accessibility   string `json:"accessibility"`    // granted|denied|unknown|n/a
+	Note            string `json:"note,omitempty"`
 }
 
 var (
 	screenMu     sync.Mutex
 	lastScreen   ScreenMeta
-	lastClickImg struct{ X, Y int; Set bool } // image-space coords for overlay
+	lastClickImg struct {
+		X, Y int
+		Set  bool
+	} // image-space coords for overlay
 )
 
 // LastScreen returns dimensions from the most recent Screenshot (if any).
@@ -66,7 +77,7 @@ func SetLastClickImage(x, y int) {
 	screenMu.Unlock()
 }
 
-// ImageToScreen maps image-space click coords to physical screen pixels.
+// ImageToScreen maps image-space click coords to physical/logical screen pixels.
 func ImageToScreen(meta ScreenMeta, ix, iy int) (sx, sy int) {
 	sw, sh := meta.ScreenW, meta.ScreenH
 	if sw <= 0 {
@@ -83,49 +94,40 @@ func ImageToScreen(meta ScreenMeta, ix, iy int) (sx, sy int) {
 	return sx, sy
 }
 
+func enabled() bool {
+	v := strings.TrimSpace(os.Getenv("MARBLE_PEER_DESKTOP"))
+	if v == "0" || strings.EqualFold(v, "false") {
+		return false
+	}
+	return true
+}
+
 // Screenshot captures the primary display as JPEG bytes.
 func Screenshot(ctx context.Context) ([]byte, ScreenMeta, error) {
+	if !enabled() {
+		return nil, ScreenMeta{}, fmt.Errorf("desktop disabled (MARBLE_PEER_DESKTOP=0)")
+	}
 	dir, err := os.MkdirTemp("", "marble-peer-shot-*")
 	if err != nil {
 		return nil, ScreenMeta{}, err
 	}
 	defer os.RemoveAll(dir)
 	out := filepath.Join(dir, "s.png")
-
-	var lastErr error
-	// Order: grim (native Wayland), gnome-screenshot, ImageMagick import, scrot.
-	try := []struct {
-		name string
-		args []string
-	}{
-		{"grim", []string{out}},
-		{"gnome-screenshot", []string{"-f", out}},
-		{"import", []string{"-window", "root", out}},
-		{"scrot", []string{"-o", out}},
+	coordW, coordH, err := screenshotOS(ctx, out)
+	if err != nil {
+		return nil, ScreenMeta{}, err
 	}
-	for _, t := range try {
-		if _, err := exec.LookPath(t.name); err != nil {
-			continue
-		}
-		cmd := exec.CommandContext(ctx, t.name, t.args...)
-		ensureDisplay(cmd)
-		if outb, err := cmd.CombinedOutput(); err != nil {
-			lastErr = fmt.Errorf("%s: %v: %s", t.name, err, strings.TrimSpace(string(outb)))
-			continue
-		}
-		if st, err := os.Stat(out); err != nil || st.Size() == 0 {
-			lastErr = fmt.Errorf("%s wrote empty file", t.name)
-			continue
-		}
-		return encodeShot(out)
-	}
-	if lastErr != nil {
-		return nil, ScreenMeta{}, fmt.Errorf("screenshot failed: %v", lastErr)
-	}
-	return nil, ScreenMeta{}, fmt.Errorf("no screenshot tool (install gnome-screenshot, grim, or imagemagick)")
+	return encodeShotMapped(out, coordW, coordH)
 }
 
 func encodeShot(path string) ([]byte, ScreenMeta, error) {
+	return encodeShotMapped(path, 0, 0)
+}
+
+// encodeShotMapped JPEG-encodes path. If coordW/coordH > 0 they are the click
+// coordinate space (e.g. macOS logical points on a Retina display); otherwise
+// the decoded image pixel size is used (Linux).
+func encodeShotMapped(path string, coordW, coordH int) ([]byte, ScreenMeta, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, ScreenMeta{}, err
@@ -137,21 +139,26 @@ func encodeShot(path string) ([]byte, ScreenMeta, error) {
 		return raw, ScreenMeta{}, rerr
 	}
 	b := img.Bounds()
-	screenW, screenH := b.Dx(), b.Dy()
-	if screenW <= 0 || screenH <= 0 {
+	imgW0, imgH0 := b.Dx(), b.Dy()
+	if imgW0 <= 0 || imgH0 <= 0 {
 		return nil, ScreenMeta{}, fmt.Errorf("screenshot decoded with empty bounds")
 	}
 
+	screenW, screenH := imgW0, imgH0
+	if coordW > 0 && coordH > 0 {
+		screenW, screenH = coordW, coordH
+	}
+
 	scaled := img
-	imgW, imgH := screenW, screenH
-	scale := 1.0
-	if max(screenW, screenH) > MaxScreenshotEdge {
-		if screenW >= screenH {
+	imgW, imgH := imgW0, imgH0
+	scale := float64(screenW) / float64(imgW)
+	if max(imgW, imgH) > MaxScreenshotEdge {
+		if imgW >= imgH {
 			imgW = MaxScreenshotEdge
-			imgH = screenH * MaxScreenshotEdge / screenW
+			imgH = imgH0 * MaxScreenshotEdge / imgW0
 		} else {
 			imgH = MaxScreenshotEdge
-			imgW = screenW * MaxScreenshotEdge / screenH
+			imgW = imgW0 * MaxScreenshotEdge / imgH0
 		}
 		if imgW < 1 {
 			imgW = 1
@@ -240,22 +247,6 @@ func drawCrosshair(src image.Image, cx, cy int) image.Image {
 	return dst
 }
 
-func findXdotool() (string, error) {
-	home, _ := os.UserHomeDir()
-	for _, p := range []string{
-		filepath.Join(home, ".local/bin/xdotool"),
-		"xdotool",
-	} {
-		if p == "xdotool" {
-			return exec.LookPath("xdotool")
-		}
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("xdotool not found")
-}
-
 func normalizeButton(button string) string {
 	b := strings.TrimSpace(strings.ToLower(button))
 	switch b {
@@ -276,9 +267,11 @@ func normalizeButton(button string) string {
 }
 
 // Click moves and clicks. Coordinates are in **screenshot image space** (meta.w×meta.h).
-// Peer maps to physical screen pixels. Empty button is forced to "1".
-// Does not raise Chrome — absolute coords should hit whatever is under the pixel.
+// Peer maps to physical/logical screen pixels. Empty button is forced to "1".
 func Click(ctx context.Context, x, y int, button string) error {
+	if !enabled() {
+		return fmt.Errorf("desktop disabled (MARBLE_PEER_DESKTOP=0)")
+	}
 	button = normalizeButton(button)
 	if x < 0 || y < 0 {
 		return fmt.Errorf("invalid click coordinates (%d,%d)", x, y)
@@ -295,288 +288,59 @@ func Click(ctx context.Context, x, y int, button string) error {
 	}
 	sx, sy := ImageToScreen(meta, x, y)
 	SetLastClickImage(x, y)
-
-	xd, err := findXdotool()
-	if err != nil {
-		if err2 := clickYdotool(ctx, sx, sy, button); err2 == nil {
-			logActiveWindow(ctx, "")
-			return nil
-		}
-		return fmt.Errorf("%v (and ydotool unavailable)", err)
-	}
-
-	// No raiseUsefulWindow on click — absolute coords; raising steals focus incorrectly.
-
-	var errs []string
-	if err := xdotoolMoveClick(ctx, xd, sx, sy, button, false); err == nil {
-		logActiveWindow(ctx, xd)
-		return nil
-	} else {
-		errs = append(errs, "mousemove+click: "+err.Error())
-	}
-	if err := xdotoolMoveDownUp(ctx, xd, sx, sy, button); err == nil {
-		logActiveWindow(ctx, xd)
-		return nil
-	} else {
-		errs = append(errs, "mousedown/up: "+err.Error())
-	}
-	if err := xdotoolMoveClick(ctx, xd, sx, sy, button, true); err == nil {
-		logActiveWindow(ctx, xd)
-		return nil
-	} else {
-		errs = append(errs, "clearmod click: "+err.Error())
-	}
-	if err := clickYdotool(ctx, sx, sy, button); err == nil {
-		logActiveWindow(ctx, xd)
-		return nil
-	} else if !strings.Contains(err.Error(), "not found") {
-		errs = append(errs, "ydotool: "+err.Error())
-	}
-
-	return fmt.Errorf("desktop click failed after %d strategies (image=%d,%d screen=%d,%d): %s",
-		len(errs), x, y, sx, sy, strings.Join(errs, " | "))
+	return clickOS(ctx, sx, sy, button)
 }
 
-func logActiveWindow(ctx context.Context, xd string) {
-	if xd == "" {
-		var err error
-		xd, err = findXdotool()
-		if err != nil {
-			return
-		}
-	}
-	cmd := exec.CommandContext(ctx, xd, "getactivewindow", "getwindowname")
-	ensureDisplay(cmd)
-	out, err := cmd.CombinedOutput()
-	name := strings.TrimSpace(string(out))
-	if err != nil || name == "" {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "marble-peer desktop: active window after click: %s\n", name)
-}
-
-func xdotoolMoveClick(ctx context.Context, xd string, x, y int, button string, clear bool) error {
-	cmd := exec.CommandContext(ctx, xd, "mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y))
-	ensureDisplay(cmd)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return xdotoolErr("mousemove", err, out)
-	}
-	args := []string{"click"}
-	if clear {
-		args = append(args, "--clearmodifiers")
-	}
-	args = append(args, button)
-	cmd = exec.CommandContext(ctx, xd, args...)
-	ensureDisplay(cmd)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return xdotoolErr("click", err, out)
-	}
-	return nil
-}
-
-func xdotoolMoveDownUp(ctx context.Context, xd string, x, y int, button string) error {
-	cmd := exec.CommandContext(ctx, xd, "mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y))
-	ensureDisplay(cmd)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return xdotoolErr("mousemove", err, out)
-	}
-	for _, op := range []string{"mousedown", "mouseup"} {
-		cmd = exec.CommandContext(ctx, xd, op, button)
-		ensureDisplay(cmd)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return xdotoolErr(op, err, out)
-		}
-	}
-	return nil
-}
-
-func clickYdotool(ctx context.Context, x, y int, button string) error {
-	yd, err := exec.LookPath("ydotool")
-	if err != nil {
-		return fmt.Errorf("ydotool not found")
-	}
-	// ydotool mousemove absolute requires ydotoold; try anyway.
-	cmd := exec.CommandContext(ctx, yd, "mousemove", "--absolute", "-x", strconv.Itoa(x), "-y", strconv.Itoa(y))
-	ensureDisplay(cmd)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("ydotool mousemove: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	// 0xC0 = left click in some ydotool versions; also try "click 0"
-	for _, args := range [][]string{
-		{"click", "0"},
-		{"click", "0xC0"},
-		{"click", button},
-	} {
-		cmd = exec.CommandContext(ctx, yd, args...)
-		ensureDisplay(cmd)
-		if out, err := cmd.CombinedOutput(); err == nil {
-			return nil
-		} else {
-			_ = out
-		}
-	}
-	return fmt.Errorf("ydotool click failed")
-}
-
-// Type types text via xdotool, with wtype fallback on Wayland.
+// Type types text into the focused window.
 func Type(ctx context.Context, text string) error {
+	if !enabled() {
+		return fmt.Errorf("desktop disabled (MARBLE_PEER_DESKTOP=0)")
+	}
 	if text == "" {
 		return fmt.Errorf("empty text")
 	}
-	xd, err := findXdotool()
-	if err == nil {
-		_ = raiseUsefulWindow(ctx, xd)
-		cmd := exec.CommandContext(ctx, xd, "type", "--clearmodifiers", "--delay", "12", "--", text)
-		ensureDisplay(cmd)
-		if out, err := cmd.CombinedOutput(); err == nil {
-			return nil
-		} else {
-			// fall through to wtype
-			_ = out
-		}
-	}
-	if wtype, err := exec.LookPath("wtype"); err == nil {
-		cmd := exec.CommandContext(ctx, wtype, "--", text)
-		ensureDisplay(cmd)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("wtype: %v: %s", err, strings.TrimSpace(string(out)))
-		}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	return fmt.Errorf("type failed (xdotool and wtype)")
+	return typeOS(ctx, text)
 }
 
-// Key sends a key name (e.g. Return, ctrl+c).
+// Key sends a key name (e.g. Return, ctrl+c, cmd+c).
 func Key(ctx context.Context, key string) error {
+	if !enabled() {
+		return fmt.Errorf("desktop disabled (MARBLE_PEER_DESKTOP=0)")
+	}
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return fmt.Errorf("empty key")
 	}
-	xd, err := findXdotool()
-	if err == nil {
-		_ = raiseUsefulWindow(ctx, xd)
-		cmd := exec.CommandContext(ctx, xd, "key", "--clearmodifiers", key)
-		ensureDisplay(cmd)
-		if out, err := cmd.CombinedOutput(); err == nil {
-			return nil
-		} else {
-			_ = out
-		}
-	}
-	// wtype -k for single keys
-	if wtype, err := exec.LookPath("wtype"); err == nil {
-		// Map a few common names
-		k := key
-		switch strings.ToLower(key) {
-		case "return", "enter":
-			k = "Return"
-		case "esc", "escape":
-			k = "Escape"
-		case "tab":
-			k = "Tab"
-		case "backspace":
-			k = "BackSpace"
-		}
-		cmd := exec.CommandContext(ctx, wtype, "-k", k)
-		ensureDisplay(cmd)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("wtype key: %v: %s", err, strings.TrimSpace(string(out)))
-		}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	return fmt.Errorf("key failed")
+	return keyOS(ctx, key)
 }
 
-// raiseUsefulWindow focuses Chrome / GNOME terminal so clicks land somewhere useful.
-func raiseUsefulWindow(ctx context.Context, xd string) error {
-	// Class matches first (more stable than title).
-	classQueries := []string{"Google-chrome", "google-chrome", "Chromium", "chromium", "Firefox", "firefox"}
-	for _, class := range classQueries {
-		cmd := exec.CommandContext(ctx, xd, "search", "--onlyvisible", "--class", class)
-		ensureDisplay(cmd)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			continue
-		}
-		ids := strings.Fields(string(out))
-		if len(ids) == 0 {
-			continue
-		}
-		wid := ids[len(ids)-1]
-		act := exec.CommandContext(ctx, xd, "windowactivate", "--sync", wid)
-		ensureDisplay(act)
-		if err := act.Run(); err == nil {
-			return nil
-		}
-	}
-	for _, name := range []string{"Chrome", "Chromium", "Gmail", "UPS", "Firefox"} {
-		cmd := exec.CommandContext(ctx, xd, "search", "--onlyvisible", "--name", name)
-		ensureDisplay(cmd)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			continue
-		}
-		ids := strings.Fields(string(out))
-		if len(ids) == 0 {
-			continue
-		}
-		wid := ids[len(ids)-1]
-		act := exec.CommandContext(ctx, xd, "windowactivate", "--sync", wid)
-		ensureDisplay(act)
-		if err := act.Run(); err == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("no focusable window")
-}
-
-func xdotoolErr(op string, err error, out []byte) error {
-	msg := strings.TrimSpace(string(out))
-	if strings.Contains(msg, "BadValue") || strings.Contains(msg, "XTest") || strings.Contains(msg, "X Error") {
-		return fmt.Errorf("xdotool %s XTest error (%v: %s) — ensure DISPLAY/XAUTHORITY (peer session wrapper); retry after computer_screenshot", op, err, msg)
-	}
-	return fmt.Errorf("xdotool %s: %v: %s", op, err, msg)
-}
-
-// Available reports whether desktop ops can work.
+// Available reports whether desktop ops can work (tools present; permissions may still be needed).
 func Available() (bool, string) {
-	hasShot := false
-	for _, n := range []string{"grim", "gnome-screenshot", "import", "scrot"} {
-		if _, err := exec.LookPath(n); err == nil {
-			hasShot = true
-			break
-		}
+	if !enabled() {
+		return false, "disabled (MARBLE_PEER_DESKTOP=0)"
 	}
-	if !hasShot {
-		return false, "no screenshot tool"
-	}
-	_, xdErr := findXdotool()
-	_, ydErr := exec.LookPath("ydotool")
-	_, wtErr := exec.LookPath("wtype")
-	if xdErr != nil && ydErr != nil {
-		return true, "screenshot ok; no xdotool/ydotool for click — install xdotool"
-	}
-	parts := []string{"screenshot ok"}
-	if xdErr == nil {
-		parts = append(parts, "xdotool")
-	}
-	if ydErr == nil {
-		parts = append(parts, "ydotool")
-	}
-	if wtErr == nil {
-		parts = append(parts, "wtype")
-	}
-	if os.Getenv("XDG_SESSION_TYPE") == "wayland" || os.Getenv("WAYLAND_DISPLAY") != "" {
-		parts = append(parts, "wayland/XWayland")
-	}
-	return true, strings.Join(parts, "; ")
+	return availableOS()
 }
+
+// ProbeClick runs a no-op-ish mouse query (health).
+func ProbeClick(ctx context.Context) error {
+	if !enabled() {
+		return fmt.Errorf("desktop disabled (MARBLE_PEER_DESKTOP=0)")
+	}
+	return probeClickOS(ctx)
+}
+
+// QueryPerms returns OS permission state needed for desktop capture/input.
+func QueryPerms() Perms { return queryPermsOS() }
+
+// RequestPerms triggers OS permission prompts when possible (macOS TCC).
+func RequestPerms() Perms { return requestPermsOS() }
+
+// OpenPrivacySettings opens the OS UI for Screen Recording / Accessibility.
+func OpenPrivacySettings(section string) error { return openPrivacySettingsOS(section) }
+
+// PermsHelp is operator-facing text for granting macOS TCC (empty on other OS).
+func PermsHelp() string { return permsHelpOS() }
 
 // EnsureEnv mutates env (os.Environ-style KEY=VAL slice) with graphical session vars.
 // Used by desktop tools and keepalive inhibitors under systemd --user.
@@ -699,18 +463,3 @@ func ensureDisplay(cmd *exec.Cmd) {
 
 // Sleep helper for tests.
 func Sleep(d time.Duration) { time.Sleep(d) }
-
-// ProbeClick runs a no-op-ish mousemove to current location (health).
-func ProbeClick(ctx context.Context) error {
-	xd, err := findXdotool()
-	if err != nil {
-		return err
-	}
-	cmd := exec.CommandContext(ctx, xd, "getmouselocation")
-	ensureDisplay(cmd)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return xdotoolErr("getmouselocation", err, out)
-	}
-	return nil
-}

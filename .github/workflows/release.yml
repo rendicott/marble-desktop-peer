@@ -1,12 +1,13 @@
 # Build and publish marble-peer binaries on version tags (v*).
-# Builds run only on GitHub-hosted runners — do not upload local binaries.
+# Linux artifacts are built on ubuntu-latest; darwin artifacts on macos-latest
+# so the macOS helper sources compile in the same environment we ship for.
+# Do not upload local binaries.
 name: Release
 
 on:
   push:
     tags:
       - "v*"
-  # Re-run a release build without retagging (uses the selected tag ref).
   workflow_dispatch:
     inputs:
       tag:
@@ -18,9 +19,11 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build & publish
+  version:
+    name: Resolve tag
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
     steps:
       - name: Resolve version tag
         id: ver
@@ -40,11 +43,16 @@ jobs:
           esac
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+  build-linux:
+    name: Build Linux
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ steps.ver.outputs.tag }}
+          ref: ${{ needs.version.outputs.tag }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -54,9 +62,9 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Build release binaries
+      - name: Build
         env:
-          VERSION: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -64,14 +72,7 @@ jobs:
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           PKG="github.com/rendicott/marble-desktop-peer/internal/app"
           LDFLAGS="-s -w -X ${PKG}.PeerVersion=${VERSION} -X ${PKG}.Commit=${COMMIT} -X ${PKG}.Date=${DATE}"
-
-          builds=(
-            "linux amd64"
-            "linux arm64"
-            "darwin arm64"
-          )
-
-          for spec in "${builds[@]}"; do
+          for spec in "linux amd64" "linux arm64"; do
             set -- $spec
             GOOS="$1"
             GOARCH="$2"
@@ -82,28 +83,100 @@ jobs:
               -o "$out" ./cmd/marble-peer
             chmod +x "$out"
           done
+          ls -la dist
 
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: dist/marble-peer-linux-*
+
+  build-darwin:
+    name: Build macOS
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.version.outputs.tag }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          VERSION: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PKG="github.com/rendicott/marble-desktop-peer/internal/app"
+          LDFLAGS="-s -w -X ${PKG}.PeerVersion=${VERSION} -X ${PKG}.Commit=${COMMIT} -X ${PKG}.Date=${DATE}"
+          for spec in "darwin arm64" "darwin amd64"; do
+            set -- $spec
+            GOOS="$1"
+            GOARCH="$2"
+            out="dist/marble-peer-${GOOS}-${GOARCH}"
+            echo "Building ${out}…"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags "$LDFLAGS" \
+              -o "$out" ./cmd/marble-peer
+            chmod +x "$out"
+          done
+          ls -la dist
+
+      - name: Upload Darwin artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-binaries
+          path: dist/marble-peer-darwin-*
+
+  release:
+    name: Publish GitHub Release
+    needs: [version, build-linux, build-darwin]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          ls -la dist
           (
             cd dist
             sha256sum marble-peer-* > SHA256SUMS
           )
-          ls -la dist
           cat dist/SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: marble-peer ${{ steps.ver.outputs.tag }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: marble-peer ${{ needs.version.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
             dist/marble-peer-linux-amd64
             dist/marble-peer-linux-arm64
             dist/marble-peer-darwin-arm64
+            dist/marble-peer-darwin-amd64
             dist/SHA256SUMS
           body: |
-            Pre-built **marble-peer** binaries built on **GitHub Actions** (`CGO_ENABLED=0`).
+            Pre-built **marble-peer** binaries built on **GitHub Actions** (`CGO_ENABLED=0`). Unsigned portable files — **no `.dmg` or notarization**.
+
+            Linux targets compile on `ubuntu-latest`. macOS targets compile on `macos-latest` (not Linux cross-compile).
 
             Desktop agent for [Marble](https://github.com/rendicott/marble) remote computer-use (ADR-0020 / ADR-0021).
 
@@ -112,11 +185,12 @@ jobs:
             | `marble-peer-linux-amd64` | Linux x86_64 |
             | `marble-peer-linux-arm64` | Linux aarch64 |
             | `marble-peer-darwin-arm64` | macOS Apple Silicon |
+            | `marble-peer-darwin-amd64` | macOS Intel |
 
             ```bash
-            chmod +x marble-peer-linux-amd64
-            ./marble-peer-linux-amd64 version
-            ./marble-peer-linux-amd64 -h   # if supported; else pair / run / status
+            chmod +x marble-peer-darwin-arm64
+            ./marble-peer-darwin-arm64 version
+            ./marble-peer-darwin-arm64 doctor
             ```
 
             Verify:
@@ -125,7 +199,8 @@ jobs:
             sha256sum -c SHA256SUMS
             ```
 
-            **Linux desktop tools (recommended):** `xdotool`, `gnome-screenshot` (or ImageMagick `import`).  
+            **Linux desktop tools (recommended):** `xdotool`, `gnome-screenshot` (or ImageMagick `import`).
+            **macOS install:** `chmod +x` → `xattr -d com.apple.quarantine` (unsigned download) → move to `~/.local/bin/marble-peer` → `marble-peer doctor --open-settings` → grant **Screen Recording** and **Accessibility**. See the [README](https://github.com/rendicott/marble-desktop-peer#readme).
             **Chrome** required for browser automation (CDP mirror profile under `~/.marble-peer`).
 
             See the [README](https://github.com/rendicott/marble-desktop-peer#readme) for pair, run, tray, and autostart.

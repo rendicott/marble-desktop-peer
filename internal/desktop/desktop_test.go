@@ -22,6 +22,15 @@ func TestImageToScreenScaled(t *testing.T) {
 	}
 }
 
+func TestImageToScreenRetinaPoints(t *testing.T) {
+	// 3420x2224 pixels captured, click space is 1710x1112 points, JPEG edge 1280.
+	m := ScreenMeta{W: 1280, H: 832, Scale: 1710.0 / 1280.0, ScreenW: 1710, ScreenH: 1112}
+	sx, sy := ImageToScreen(m, 640, 416)
+	if sx != 855 || sy != 556 {
+		t.Fatalf("got %d,%d want 855,556", sx, sy)
+	}
+}
+
 func TestResizeNearest(t *testing.T) {
 	src := imageNewRGBA(100, 50)
 	dst := resizeNearest(src, 50, 25)

@@ -8,39 +8,104 @@ Gives the Marble harness **remote hands and eyes** on your personal machine: ful
 |--|--|
 | **Binary** | `marble-peer` |
 | **Module** | `github.com/rendicott/marble-desktop-peer` |
-| **Latest release** | **[v0.1.0](https://github.com/rendicott/marble-desktop-peer/releases/tag/v0.1.0)** |
+| **Latest release** | **[v0.1.1](https://github.com/rendicott/marble-desktop-peer/releases/tag/v0.1.1)** |
 | **Data dir** | `~/.marble-peer` (`MARBLE_PEER_HOME`) |
 | **Harness** | Marble ≥ **v0.4.1** (computers registry + peer hub) |
 
-## What's new in v0.1.0
+## What's new in v0.1.1
 
-- Mutual pair with Marble Settings → Computers  
-- `marble-peer run` daemon (WS dial-out, action queue, mini UI, tray)  
-- Chrome **user mirror** CDP path (default) so logins work without attaching to daily Chrome  
-- Desktop screenshot / click / type / key  
-- Linux autostart + tray; idle/display keep-awake  
-- GitHub Actions multi-arch binaries  
+- **macOS desktop control** (screenshot, click, type, key), Chrome profile paths, LaunchAgent, menu bar tray  
+- `marble-peer doctor` for local permissions / Chrome / screenshot probe  
+- Darwin release binaries built on **GitHub-hosted macOS** (not Linux cross-compile)  
 
 See [CHANGELOG.md](CHANGELOG.md).
 
 ## Install (prebuilt)
 
-GitHub Actions builds portable binaries on version tags (`v*`). Download from  
-**[Releases](https://github.com/rendicott/marble-desktop-peer/releases)**.
+There is **no `.dmg`**, Homebrew formula, or App Store build. GitHub Actions publishes **unsigned portable binaries** on version tags (`v*`). Download from **[Releases](https://github.com/rendicott/marble-desktop-peer/releases)**.
 
 | Asset | Platform |
 |-------|----------|
 | `marble-peer-linux-amd64` | Linux x86_64 |
 | `marble-peer-linux-arm64` | Linux aarch64 |
 | `marble-peer-darwin-arm64` | macOS Apple Silicon |
+| `marble-peer-darwin-amd64` | macOS Intel |
+
+`v0.1.0`’s `darwin-arm64` asset was a Linux cross-compile and did **not** implement Mac desktop/Chrome. **v0.1.1+** is the first functional macOS peer.
+
+### macOS
+
+Needs **Google Chrome** in `/Applications`. No other packages. Optional: [Xcode Command Line Tools](https://developer.apple.com/download/all/) (`xcode-select --install`) so the first click/type can compile a small Swift helper (`swiftc`). Built-in `screencapture`, `osascript`, and `caffeinate` are enough for doctor + screenshots.
+
+**1. Download** `marble-peer-darwin-arm64` (Apple Silicon) or `marble-peer-darwin-amd64` (Intel), plus `SHA256SUMS`, from the [latest release](https://github.com/rendicott/marble-desktop-peer/releases/latest).
+
+**2. Verify, clear Gatekeeper quarantine, install to a stable path.** LaunchAgent records the binary’s real path, so do **not** leave it in `~/Downloads`.
+
+```bash
+cd ~/Downloads
+grep marble-peer-darwin-arm64 SHA256SUMS | shasum -a 256 -c -
+chmod +x marble-peer-darwin-arm64
+# Unsigned GitHub download — otherwise macOS says the developer cannot be verified:
+xattr -d com.apple.quarantine marble-peer-darwin-arm64
+# Alternative: Finder → right-click the binary → Open → Open
+
+mkdir -p ~/.local/bin
+mv marble-peer-darwin-arm64 ~/.local/bin/marble-peer
+export PATH="$HOME/.local/bin:$PATH"   # add this line to ~/.zshrc to keep it
+```
+
+Intel: same steps with `marble-peer-darwin-amd64`.
+
+**3. Probe the machine** (tools, Chrome, screenshot, TCC):
+
+```bash
+marble-peer version
+marble-peer doctor --open-settings
+```
+
+**4. Grant permissions** to the app that *launches* marble-peer:
+
+| Setting | Why |
+|---------|-----|
+| **System Settings → Privacy & Security → Screen Recording** | Full-desktop screenshots |
+| **System Settings → Privacy & Security → Accessibility** | Synthesized click / type / key |
+
+- Run from **Terminal / iTerm**: enable that terminal app.  
+- Started as a **Login Item** (`install-autostart`): enable **marble-peer**.  
+- You may also see **osascript** / **marble-desk** — enable those if listed.  
+
+Unsigned rebuilds can drop off the list; re-grant if `doctor` reports screen/accessibility denied. Mini UI (`http://127.0.0.1:18765`) also has a permission banner.
+
+**5. Pair with Marble, then run** (see [Pair](#pair-mutual-handshake)):
+
+```bash
+marble-peer pair --harness https://YOUR-HARNESS --code HXXXXX
+marble-peer run
+```
+
+**6. Optional — start at login** (LaunchAgent `~/Library/LaunchAgents/com.rendicott.marble-peer.plist`):
+
+```bash
+marble-peer install-autostart
+launchctl print gui/$(id -u)/com.rendicott.marble-peer
+tail -f ~/Library/Logs/marble-peer.log
+```
+
+`KeepAlive` is false, so tray **Quit** is a clean exit. Data dir: `~/.marble-peer`. Uninstall:
+
+```bash
+marble-peer uninstall-autostart
+```
+
+### Linux
 
 ```bash
 chmod +x marble-peer-linux-amd64
 ./marble-peer-linux-amd64 version
 sha256sum -c SHA256SUMS   # after downloading SHA256SUMS from the same release
+mkdir -p ~/.local/bin
+mv marble-peer-linux-amd64 ~/.local/bin/marble-peer
 ```
-
-### Linux runtime deps (recommended)
 
 | Tool | Purpose |
 |------|---------|
@@ -64,13 +129,13 @@ go build -o bin/marble-peer ./cmd/marble-peer
 ./bin/marble-peer version
 ```
 
-Requires **Go 1.18+** (CI release builds use **1.22.x**). Release binaries use `CGO_ENABLED=0` (no CGO required for the default Linux path).
+Requires **Go 1.18+** (CI release builds use **1.22.x**). Release binaries use `CGO_ENABLED=0` (no CGO; Linux uses shell tools, macOS compiles a Swift helper at first use).
 
 Optional ldflags (same as CI):
 
 ```bash
 go build -ldflags "-s -w \
-  -X github.com/rendicott/marble-desktop-peer/internal/app.PeerVersion=v0.1.0 \
+  -X github.com/rendicott/marble-desktop-peer/internal/app.PeerVersion=v0.1.1 \
   -X github.com/rendicott/marble-desktop-peer/internal/app.Commit=$(git rev-parse --short HEAD) \
   -X github.com/rendicott/marble-desktop-peer/internal/app.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   -o bin/marble-peer ./cmd/marble-peer
@@ -79,8 +144,8 @@ go build -ldflags "-s -w \
 ## Your logged-in Chrome (default)
 
 **Chrome 136+ blocks remote debugging on the default profile path**
-(`~/.config/google-chrome`). Passing `--remote-debugging-port` there will start
-Chrome but **never open a CDP port**.
+(Linux `~/.config/google-chrome`, macOS `~/Library/Application Support/Google/Chrome`).
+Passing `--remote-debugging-port` there will start Chrome but **never open a CDP port**.
 
 Marble’s default **`browser_mode=user`** therefore:
 
@@ -98,6 +163,7 @@ Notes:
 - Logins are as of the last sync (not a live attach to the daily window).
 - Re-run `computer_browser_ensure` / `force=true` after you log into new sites in daily Chrome.
 - Blank isolated profile: `marble-peer run --browser-mode marble`
+- Daily Chrome data dir: Linux `~/.config/google-chrome`, macOS `~/Library/Application Support/Google/Chrome`
 
 ## Pair (mutual handshake)
 
@@ -105,7 +171,7 @@ Notes:
 2. On this machine:
 
 ```bash
-./bin/marble-peer pair \
+marble-peer pair \
   --harness http://127.0.0.1:8080 \
   --code HXXXXX \
   --allow-http   # only on private nets / localhost
@@ -115,13 +181,16 @@ Notes:
 4. Run:
 
 ```bash
-export DISPLAY=:0   # if needed (headless SSH without a seat will not work)
-./bin/marble-peer run
+# Linux only, if needed (headless SSH without a seat will not work):
+# export DISPLAY=:0
+marble-peer run
 ```
 
 Mini UI (status / confirm): `http://127.0.0.1:18765` (or next free port; see `~/.marble-peer/state.json`).
 
-## Autostart + system tray (Linux)
+## Autostart + system tray
+
+### Linux
 
 Starts at login via **systemd --user** (and a GNOME autostart desktop file as backup).
 
@@ -170,6 +239,25 @@ marble-peer uninstall-autostart   # disable + remove unit/desktop entry
 marble-peer run --no-tray         # foreground without tray
 ```
 
+### macOS
+
+Starts at login via a **LaunchAgent** (`~/Library/LaunchAgents/com.rendicott.marble-peer.plist`). Keep-awake uses `caffeinate`. Tray is a Swift menu bar extra (compiled on first `run`).
+
+```bash
+# Binary must already live at a stable path (see macOS install above).
+marble-peer doctor
+marble-peer install-autostart
+launchctl print gui/$(id -u)/com.rendicott.marble-peer
+tail -f ~/Library/Logs/marble-peer.log
+```
+
+After the first LaunchAgent start, grant **Screen Recording** and **Accessibility** to `marble-peer` (System Settings). `KeepAlive` is false so tray **Quit** is a clean exit.
+
+```bash
+marble-peer uninstall-autostart
+marble-peer run --no-tray
+```
+
 ## CLI overview
 
 | Command | Purpose |
@@ -178,7 +266,8 @@ marble-peer run --no-tray         # foreground without tray
 | `marble-peer run` | Long-running daemon (WS + actions + optional tray) |
 | `marble-peer status` | Local JSON status + desktop availability |
 | `marble-peer unpair` | Clear local computer id + device token |
-| `marble-peer install-autostart` / `uninstall-autostart` | Linux user systemd + desktop entry |
+| `marble-peer install-autostart` / `uninstall-autostart` | Login start (Linux systemd --user / macOS LaunchAgent) |
+| `marble-peer doctor` | Local probe: Chrome, desktop tools, macOS TCC, screenshot |
 | `marble-peer version` | Print version (release builds inject tag/commit/date) |
 
 ## Design & protocol
@@ -203,12 +292,14 @@ marble-peer run --no-tray         # foreground without tray
 GitHub Actions builds on tags `v*` (and `workflow_dispatch` re-run). Same pattern as [marble-harness](https://github.com/rendicott/marble).
 
 ```bash
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
-# Workflow "Release" builds on ubuntu-latest, tests, attaches assets
+git tag -a v0.1.1 -m "v0.1.1"
+git push origin v0.1.1
+# Workflow "Release" tests on Linux + macOS, attaches assets
 ```
 
-If a tag exists but the workflow failed: **Actions → Release → Run workflow** → enter tag (e.g. `v0.1.0`).
+Linux binaries build on `ubuntu-latest`. Darwin binaries build on `macos-latest` (not cross-compiled from Linux). Unsigned portable files only — no `.dmg` or notarization.
+
+If a tag exists but the workflow failed: **Actions → Release → Run workflow** → enter tag (e.g. `v0.1.1`).
 
 Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml).
 

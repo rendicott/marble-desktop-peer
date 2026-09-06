@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -112,6 +113,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "\n# Quit all Chrome windows first, then run the command above.")
 		fmt.Fprintln(os.Stderr, "# Leave that Chrome open; in another terminal: marble-peer run")
 		fmt.Fprintln(os.Stderr, "# Peer attaches to port 9222 and uses YOUR profile (cookies/logins).")
+	case "doctor":
+		fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+		openSettings := fs.Bool("open-settings", false, "Open macOS Privacy Settings panes")
+		request := fs.Bool("request-perms", true, "Request Screen Recording / Accessibility prompts on macOS")
+		shot := fs.Bool("screenshot", true, "Try a real screenshot")
+		_ = fs.Parse(args)
+		os.Exit(runDoctor(*openSettings, *request, *shot))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -129,20 +137,21 @@ Commands:
   pair --serve
   run [--kill-browser-on-exit] [--no-miniui] [--no-tray]
   status
+  doctor [--open-settings] [--request-perms=false] [--screenshot=false]
   unpair
-  install-autostart [--no-enable]   # systemd --user + desktop autostart (login)
+  install-autostart [--no-enable]   # login start (LaunchAgent / systemd --user)
   uninstall-autostart
   print-chrome-cmd
   version
 
 Browser modes (config browser_mode or MARBLE_PEER_BROWSER_MODE):
-  user   (default) — mirror of ~/.config/google-chrome (your logins) + CDP
+  user   (default) — mirror of your daily Chrome profile (logins) + CDP
   marble           — isolated ~/.marble-peer/chrome-profile
 
-Autostart (Linux):
+Autostart:
   marble-peer install-autostart
-  systemctl --user status marble-peer
-  journalctl --user -u marble-peer -f
+  # Linux: systemctl --user status marble-peer
+  # macOS: launchctl print gui/$(id -u)/com.rendicott.marble-peer
   tail -f ~/.marble-peer/peer.log
 `)
 }
@@ -328,6 +337,7 @@ func serveMiniUI(ctx context.Context, a *app.App, cancel context.CancelFunc) (st
 <body style="font-family:system-ui;background:#0f1115;color:#e8ecf4;padding:1.5rem;max-width:52rem">
 <h1 style="margin-top:0">marble-peer</h1>
 %s
+%s
 <pre style="background:#171a21;padding:1rem;border-radius:8px;overflow:auto">%s</pre>
 <p>
   <a style="color:#7c9cff" href="/pair">Pair</a> ·
@@ -336,7 +346,7 @@ func serveMiniUI(ctx context.Context, a *app.App, cancel context.CancelFunc) (st
   <form style="display:inline" method=post action="/quit"><button>Quit</button></form>
 </p>
 <p style="color:#6b7280;font-size:0.85rem">When the agent calls <code>computer_confirm</code>, a notification opens and this page shows Accept/Deny. Default is deny after 120s.</p>
-</body>`, banner, string(b))
+</body>`, banner, macosPermsHTML(st), string(b))
 	})
 	mux.HandleFunc("/status.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -353,6 +363,16 @@ func serveMiniUI(ctx context.Context, a *app.App, cancel context.CancelFunc) (st
 		}
 		a.Q.Cancel()
 		fmt.Fprint(w, "ok")
+	})
+	mux.HandleFunc("/macos-perms", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		p := desktop.RequestPerms()
+		_ = desktop.OpenPrivacySettings("all")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(p)
 	})
 	mux.HandleFunc("/quit", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost && r.Method != http.MethodGet {
@@ -395,4 +415,109 @@ func htmlEsc(s string) string {
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, `"`, "&quot;")
 	return s
+}
+
+func macosPermsHTML(st map[string]interface{}) string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+	p, _ := st["macos_perms"].(desktop.Perms)
+	if p.ScreenRecording == "" {
+		p = desktop.QueryPerms()
+	}
+	color := func(v string) string {
+		switch v {
+		case "granted":
+			return "#16a34a"
+		case "denied":
+			return "#dc2626"
+		default:
+			return "#f59e0b"
+		}
+	}
+	return fmt.Sprintf(`<div style="background:#171a21;border:1px solid #2a3140;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.25rem">
+<h2 style="margin:0 0 0.5rem;font-size:1rem">macOS permissions</h2>
+<p style="margin:0.25rem 0">Screen Recording: <b style="color:%s">%s</b> · Accessibility: <b style="color:%s">%s</b></p>
+<p style="margin:0.5rem 0 0;color:#9aa3b5;font-size:0.85rem">Desktop screenshot needs Screen Recording; click/type/key need Accessibility. Grant them to the app that launched marble-peer (Terminal / iTerm, or marble-peer if started as a Login Item).</p>
+<p style="margin:0.75rem 0 0">
+  <form style="display:inline" method=post action="/macos-perms"><button>Request permissions + open Settings</button></form>
+</p>
+</div>`, color(p.ScreenRecording), htmlEsc(p.ScreenRecording), color(p.Accessibility), htmlEsc(p.Accessibility))
+}
+
+func runDoctor(openSettings, requestPerms, doShot bool) int {
+	fmt.Printf("marble-peer doctor  %s\n", app.VersionString())
+	fmt.Printf("os:        %s/%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("home:      %s\n", config.Home())
+
+	bin := browser.ChromeBinary()
+	if bin == "" {
+		fmt.Println("chrome:    NOT FOUND")
+	} else {
+		fmt.Println("chrome:   ", bin)
+	}
+	fmt.Println("profile:  ", browser.UserChromeDir())
+
+	ok, note := desktop.Available()
+	fmt.Printf("desktop:   %v (%s)\n", ok, note)
+
+	ls := desktop.QueryLockState(context.Background())
+	fmt.Printf("lock:      locked=%v source=%s %s\n", ls.Locked, ls.Source, ls.Detail)
+
+	failed := false
+	if runtime.GOOS == "darwin" {
+		if requestPerms {
+			fmt.Println("perms:     requesting Screen Recording + Accessibility prompts…")
+			p := desktop.RequestPerms()
+			fmt.Printf("perms:     screen=%s accessibility=%s\n", p.ScreenRecording, p.Accessibility)
+		} else {
+			p := desktop.QueryPerms()
+			fmt.Printf("perms:     screen=%s accessibility=%s\n", p.ScreenRecording, p.Accessibility)
+		}
+		if openSettings {
+			_ = desktop.OpenPrivacySettings("all")
+			fmt.Println("perms:     opened System Settings privacy panes")
+		}
+		if h := desktop.PermsHelp(); h != "" && requestPerms {
+			fmt.Println(h)
+		}
+	}
+
+	if doShot {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		img, meta, err := desktop.Screenshot(ctx)
+		if err != nil {
+			fmt.Println("screenshot FAILED:", err)
+			failed = true
+		} else {
+			fmt.Printf("screenshot ok  bytes=%d image=%dx%d screen=%dx%d scale=%.2f\n",
+				len(img), meta.W, meta.H, meta.ScreenW, meta.ScreenH, meta.Scale)
+		}
+		if err := desktop.ProbeClick(ctx); err != nil {
+			fmt.Println("input probe:", err)
+			// probe may fail without Accessibility; don't fail doctor if screenshot worked
+			if runtime.GOOS != "darwin" {
+				failed = true
+			}
+		} else {
+			fmt.Println("input probe ok")
+		}
+		if runtime.GOOS == "darwin" {
+			p := desktop.QueryPerms()
+			fmt.Printf("perms after shot: screen=%s accessibility=%s\n", p.ScreenRecording, p.Accessibility)
+		}
+	}
+
+	if !ok {
+		failed = true
+	}
+	if bin == "" {
+		fmt.Println("note: Chrome not found — browser automation will be unavailable until Google Chrome is installed.")
+	}
+	if failed {
+		return 1
+	}
+	fmt.Println("doctor: ok")
+	return 0
 }

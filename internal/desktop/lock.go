@@ -4,18 +4,22 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
 )
 
 // LockState reports whether the session appears locked / on greeter.
 type LockState struct {
-	Locked  bool   `json:"locked"`
-	Source  string `json:"source,omitempty"`  // screensaver|loginctl|unknown
-	Detail  string `json:"detail,omitempty"`
+	Locked bool   `json:"locked"`
+	Source string `json:"source,omitempty"` // screensaver|loginctl|unknown
+	Detail string `json:"detail,omitempty"`
 }
 
-// QueryLockState best-effort detects GNOME/session lock screens.
+// QueryLockState best-effort detects session lock screens.
 func QueryLockState(ctx context.Context) LockState {
+	if runtime.GOOS == "darwin" {
+		return queryLockDarwin(ctx)
+	}
 	// org.gnome.ScreenSaver.GetActive
 	for _, dest := range []struct {
 		dest, path, method string
@@ -55,6 +59,30 @@ func QueryLockState(ctx context.Context) LockState {
 			if strings.EqualFold(v, "no") {
 				return LockState{Locked: false, Source: "loginctl", Detail: "LockedHint=no"}
 			}
+		}
+	}
+	return LockState{Locked: false, Source: "unknown", Detail: "could not query"}
+}
+
+func queryLockDarwin(ctx context.Context) LockState {
+	cmd := exec.CommandContext(ctx, "ioreg", "-n", "Root", "-d1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		s := string(out)
+		if i := strings.Index(s, `"IOConsoleLocked"`); i >= 0 {
+			frag := s[i:]
+			if len(frag) > 80 {
+				frag = frag[:80]
+			}
+			if strings.Contains(frag, "= Yes") || strings.Contains(frag, "= true") || strings.Contains(frag, "= True") {
+				return LockState{Locked: true, Source: "ioreg", Detail: "IOConsoleLocked=Yes"}
+			}
+			if strings.Contains(frag, "= No") || strings.Contains(frag, "= false") || strings.Contains(frag, "= False") {
+				return LockState{Locked: false, Source: "ioreg", Detail: "IOConsoleLocked=No"}
+			}
+		}
+		if strings.Contains(s, `"CGSSessionScreenIsLocked" = Yes`) {
+			return LockState{Locked: true, Source: "ioreg", Detail: "CGSSessionScreenIsLocked=Yes"}
 		}
 	}
 	return LockState{Locked: false, Source: "unknown", Detail: "could not query"}

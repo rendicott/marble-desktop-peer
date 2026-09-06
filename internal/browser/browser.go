@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,15 +32,15 @@ const (
 
 // Manager attaches to or launches Chromium for CDP control.
 type Manager struct {
-	mu         sync.Mutex
-	cmd        *exec.Cmd // only set if we launched Chrome ourselves
-	port       int
-	profile    string // user-data-dir used for CDP Chrome
-	sourceDir  string // real Chrome dir we sync from (ModeUser)
-	mode       string
-	ready      bool
-	owned      bool   // true if we spawned Chrome (safe to kill on --kill-browser-on-exit)
-	lastURL    string // last navigated URL — preferred CDP target
+	mu        sync.Mutex
+	cmd       *exec.Cmd // only set if we launched Chrome ourselves
+	port      int
+	profile   string // user-data-dir used for CDP Chrome
+	sourceDir string // real Chrome dir we sync from (ModeUser)
+	mode      string
+	ready     bool
+	owned     bool   // true if we spawned Chrome (safe to kill on --kill-browser-on-exit)
+	lastURL   string // last navigated URL — preferred CDP target
 }
 
 // Options for New.
@@ -92,19 +93,49 @@ func userChromeDataDir() string {
 		return v
 	}
 	h, _ := os.UserHomeDir()
-	// Prefer Google Chrome, then Chromium.
-	candidates := []string{
-		filepath.Join(h, ".config", "google-chrome"),
-		filepath.Join(h, ".config", "chromium"),
-		filepath.Join(h, ".config", "google-chrome-beta"),
-	}
-	for _, c := range candidates {
+	for _, c := range chromeDataDirCandidates(runtime.GOOS, h) {
 		if st, err := os.Stat(c); err == nil && st.IsDir() {
 			return c
 		}
 	}
+	cands := chromeDataDirCandidates(runtime.GOOS, h)
+	if len(cands) > 0 {
+		return cands[0]
+	}
 	return filepath.Join(h, ".config", "google-chrome")
 }
+
+// chromeDataDirCandidates is the ordered list of daily Chrome/Chromium profile dirs.
+func chromeDataDirCandidates(goos, home string) []string {
+	switch goos {
+	case "darwin":
+		return []string{
+			filepath.Join(home, "Library", "Application Support", "Google", "Chrome"),
+			filepath.Join(home, "Library", "Application Support", "Chromium"),
+			filepath.Join(home, "Library", "Application Support", "Google", "Chrome Canary"),
+			filepath.Join(home, "Library", "Application Support", "Microsoft Edge"),
+		}
+	case "windows":
+		local := os.Getenv("LOCALAPPDATA")
+		if local == "" {
+			local = filepath.Join(home, "AppData", "Local")
+		}
+		return []string{
+			filepath.Join(local, "Google", "Chrome", "User Data"),
+			filepath.Join(local, "Chromium", "User Data"),
+			filepath.Join(local, "Microsoft", "Edge", "User Data"),
+		}
+	default:
+		return []string{
+			filepath.Join(home, ".config", "google-chrome"),
+			filepath.Join(home, ".config", "chromium"),
+			filepath.Join(home, ".config", "google-chrome-beta"),
+		}
+	}
+}
+
+// UserChromeDir is the daily Chrome profile marble mirrors (ModeUser).
+func UserChromeDir() string { return userChromeDataDir() }
 
 // SyncUserProfile copies logins/cookies from the daily Chrome dir into the mirror.
 // Safe while daily Chrome is running for most files; best after force (daily Chrome quit).
@@ -189,10 +220,13 @@ func copyDir(src, dst string) error {
 }
 
 func findChrome() string {
-	for _, c := range []string{
-		"google-chrome-stable", "google-chrome", "chromium-browser", "chromium",
-		"/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium-browser",
-	} {
+	for _, c := range chromeBinaryCandidates(runtime.GOOS) {
+		if !strings.Contains(c, string(os.PathSeparator)) {
+			if p, err := exec.LookPath(c); err == nil {
+				return p
+			}
+			continue
+		}
 		if p, err := exec.LookPath(c); err == nil {
 			return p
 		}
@@ -202,6 +236,33 @@ func findChrome() string {
 	}
 	return ""
 }
+
+func chromeBinaryCandidates(goos string) []string {
+	switch goos {
+	case "darwin":
+		return []string{
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			"google-chrome", "chromium",
+		}
+	case "windows":
+		return []string{
+			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+			`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+			"chrome.exe", "msedge.exe",
+		}
+	default:
+		return []string{
+			"google-chrome-stable", "google-chrome", "chromium-browser", "chromium",
+			"/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium-browser",
+		}
+	}
+}
+
+// ChromeBinary is the system Chrome/Chromium/Edge executable, or "".
+func ChromeBinary() string { return findChrome() }
 
 func freePort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -384,8 +445,10 @@ func (m *Manager) launch(ctx context.Context) error {
 		"--user-data-dir=" + m.profile,
 		"--no-first-run",
 		"--no-default-browser-check",
+	}
+	if runtime.GOOS == "linux" {
 		// Prefer X11 so desktop xdotool can interact if needed; Wayland breaks XTEST.
-		"--ozone-platform=x11",
+		args = append(args, "--ozone-platform=x11")
 	}
 	// User mode: restore session in THIS instance (do not open a second "about:blank" window later).
 	if m.mode == ModeUser {
@@ -444,6 +507,9 @@ func portFree(port int) bool {
 
 func chromeEnv() []string {
 	env := os.Environ()
+	if runtime.GOOS != "linux" {
+		return env
+	}
 	if os.Getenv("DISPLAY") == "" {
 		env = append(env, "DISPLAY=:0")
 	}
@@ -541,9 +607,12 @@ func discoverCDPPorts(preferred int, profile string) []int {
 
 // scanChromeDebugPortsFromProc finds --remote-debugging-port values on live Chrome processes.
 func scanChromeDebugPortsFromProc() []int {
+	if runtime.GOOS != "linux" {
+		return scanChromeDebugPortsFromPS()
+	}
 	ents, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil
+		return scanChromeDebugPortsFromPS()
 	}
 	var ports []int
 	seen := map[int]bool{}
@@ -577,6 +646,41 @@ func scanChromeDebugPortsFromProc() []int {
 		// cmdline is null-separated; stop at null or space
 		end := 0
 		for end < len(rest) && rest[end] != 0 && rest[end] != ' ' {
+			end++
+		}
+		p, err := strconv.Atoi(rest[:end])
+		if err != nil || p <= 0 || seen[p] {
+			continue
+		}
+		seen[p] = true
+		ports = append(ports, p)
+	}
+	return ports
+}
+
+func scanChromeDebugPortsFromPS() []int {
+	cmd := exec.Command("ps", "ax", "-o", "command=")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil
+	}
+	var ports []int
+	seen := map[int]bool{}
+	const key = "--remote-debugging-port="
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(strings.ToLower(line), "chrome") && !strings.Contains(strings.ToLower(line), "chromium") {
+			continue
+		}
+		if strings.Contains(line, "--type=") {
+			continue
+		}
+		idx := strings.Index(line, key)
+		if idx < 0 {
+			continue
+		}
+		rest := line[idx+len(key):]
+		end := 0
+		for end < len(rest) && rest[end] != 0 && rest[end] != ' ' && rest[end] != '\t' {
 			end++
 		}
 		p, err := strconv.Atoi(rest[:end])
@@ -1809,8 +1913,8 @@ func cdpClickText(ctx context.Context, s *cdpSession, needle string, buttonsOnly
 		return "", fmt.Errorf("no visible element containing %q", needle)
 	}
 	var parsed struct {
-		OK         bool   `json:"ok"`
-		Reason     string `json:"reason"`
+		OK         bool    `json:"ok"`
+		Reason     string  `json:"reason"`
 		CX         float64 `json:"cx"`
 		CY         float64 `json:"cy"`
 		Candidates []struct {
@@ -1944,7 +2048,12 @@ func killProfileChrome(profile string) {
 		return
 	}
 	// Match main Chrome only when possible; fall back to user-data-dir match.
-	_ = exec.Command("pkill", "-f", "--", "user-data-dir="+profile).Run()
+	// GNU pkill accepts `--`; BSD (macOS) pkill does not.
+	if runtime.GOOS == "darwin" {
+		_ = exec.Command("pkill", "-f", "user-data-dir="+profile).Run()
+	} else {
+		_ = exec.Command("pkill", "-f", "--", "user-data-dir="+profile).Run()
+	}
 	// Give SingletonLock time to clear
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1964,7 +2073,12 @@ func killProfileChrome(profile string) {
 func PrintChromeCmd() string {
 	bin := findChrome()
 	if bin == "" {
-		bin = "google-chrome"
+		cands := chromeBinaryCandidates(runtime.GOOS)
+		if len(cands) > 0 {
+			bin = cands[0]
+		} else {
+			bin = "google-chrome"
+		}
 	}
 	src := userChromeDataDir()
 	mirror := filepath.Join(config.Home(), "chrome-user-mirror")

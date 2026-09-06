@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,9 +24,9 @@ type Guard struct {
 	cookie   uint32 // GNOME SessionManager inhibit cookie (0 = none)
 	ssCookie uint32 // freedesktop/GNOME ScreenSaver inhibit
 	// gsettings restore
-	prevIdleDelay   string
-	prevLockEnabled string
-	prevLockDelay   string
+	prevIdleDelay    string
+	prevLockEnabled  string
+	prevLockDelay    string
 	gsettingsTouched bool
 	cancel           context.CancelFunc
 	done             chan struct{}
@@ -39,6 +40,10 @@ func Start(parent context.Context) *Guard {
 		strings.EqualFold(os.Getenv("MARBLE_PEER_KEEP_AWAKE"), "false") {
 		log.Printf("keepalive: disabled (MARBLE_PEER_KEEP_AWAKE=0)")
 		return &Guard{done: make(chan struct{})}
+	}
+
+	if runtime.GOOS == "darwin" {
+		return startCaffeinate(parent)
 	}
 
 	ctx, cancel := context.WithCancel(parent)
@@ -158,6 +163,29 @@ func (g *Guard) loop(ctx context.Context) {
 	}
 }
 
+func startCaffeinate(parent context.Context) *Guard {
+	ctx, cancel := context.WithCancel(parent)
+	g := &Guard{cancel: cancel, done: make(chan struct{})}
+	path, err := exec.LookPath("caffeinate")
+	if err != nil {
+		log.Printf("keepalive: caffeinate not found")
+		close(g.done)
+		return g
+	}
+	// -d display, -i idle, -m disk, -s system (AC), -u user activity assertion
+	cmd := exec.CommandContext(ctx, path, "-dimsu")
+	if err := cmd.Start(); err != nil {
+		log.Printf("keepalive: caffeinate start: %v", err)
+		close(g.done)
+		return g
+	}
+	g.cmds = append(g.cmds, cmd)
+	go func() { _ = cmd.Wait() }()
+	log.Printf("keepalive: caffeinate -dimsu (pid=%d)", cmd.Process.Pid)
+	go g.loop(ctx)
+	return g
+}
+
 func applyX11NoBlank() {
 	xset, err := exec.LookPath("xset")
 	if err != nil {
@@ -196,7 +224,7 @@ func gnomeInhibit() (uint32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
-		return parseUint32Cookie(string(out))
+	return parseUint32Cookie(string(out))
 }
 
 func gnomeUninhibit(cookie uint32) error {

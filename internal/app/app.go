@@ -1,8 +1,8 @@
 package app
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -641,9 +641,20 @@ func notifyConfirm(prompt, risk, confirmURL string) uint32 {
 				"--app-name=marble-peer", "--hint=int:transient:1", title, body).Start()
 		}
 	}
+	if runtime.GOOS == "darwin" {
+		esc := func(s string) string {
+			s = strings.ReplaceAll(s, "\\", "\\\\")
+			s = strings.ReplaceAll(s, `"`, `\"`)
+			return s
+		}
+		_ = exec.Command("osascript", "-e",
+			`display notification "`+esc(body)+`" with title "`+esc(title)+`"`).Start()
+	}
 	// Open the Accept/Deny page (harness URL preferred by caller)
 	if _, err := exec.LookPath("xdg-open"); err == nil {
 		_ = exec.Command("xdg-open", confirmURL).Start()
+	} else if runtime.GOOS == "darwin" {
+		_ = exec.Command("open", confirmURL).Start()
 	}
 	return notifID
 }
@@ -728,7 +739,7 @@ func (a *App) StatusJSON() map[string]interface{} {
 	desk, deskNote, browserOK := cachedStatusProbes(a)
 	mini := a.miniUIBase()
 	pending := a.PendingConfirms()
-	return map[string]interface{}{
+	m := map[string]interface{}{
 		"state":            a.State(),
 		"computer_id":      a.Cfg.ComputerID,
 		"device_id":        a.Cfg.DeviceID,
@@ -748,7 +759,13 @@ func (a *App) StatusJSON() map[string]interface{} {
 		"pid":              os.Getpid(),
 		"pending_confirms": pending,
 		"confirm_count":    len(pending),
+		"os":               runtime.GOOS,
+		"arch":             runtime.GOARCH,
 	}
+	if runtime.GOOS == "darwin" {
+		m["macos_perms"] = desktop.QueryPerms()
+	}
+	return m
 }
 
 // StartMiniUI serves localhost control UI.

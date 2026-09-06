@@ -1,0 +1,40 @@
+# Compile and test on Linux + macOS. Desktop permissions are not granted on
+# GitHub-hosted runners; doctor --screenshot=false still checks tool discovery.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: go build -o bin/marble-peer ./cmd/marble-peer
+
+      - name: Version
+        run: ./bin/marble-peer version
+
+      - name: Status / doctor (no screenshot on CI)
+        run: |
+          ./bin/marble-peer status || true
+          ./bin/marble-peer doctor --screenshot=false --request-perms=false
