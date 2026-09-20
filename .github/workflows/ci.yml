@@ -51,7 +51,9 @@ jobs:
         continue-on-error: true
         run: |
           "./bin/marble-peer${EXE}" doctor --request-perms=false
-          go test -count=1 -v -run 'Screenshot|Probe|InputStruct' ./internal/desktop
+          go test -count=1 -v -run 'Screenshot|Probe|InputStruct|InputInjection' ./internal/desktop
+          go test -count=1 -v -run 'TrayScript|TrayHelper' ./internal/tray
+          go test -count=1 -v -run 'TryFlock|PidAlive' ./internal/config
 
   cross-build:
     name: Cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
