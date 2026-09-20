@@ -11,7 +11,8 @@ func TestChromeDataDirCandidatesDarwin(t *testing.T) {
 	if len(dirs) == 0 {
 		t.Fatal("empty")
 	}
-	if !strings.Contains(dirs[0], "Library/Application Support/Google/Chrome") {
+	// ToSlash: filepath.Join uses backslashes when this test runs on Windows.
+	if !strings.Contains(filepath.ToSlash(dirs[0]), "Library/Application Support/Google/Chrome") {
 		t.Fatalf("first darwin dir = %s", dirs[0])
 	}
 }
