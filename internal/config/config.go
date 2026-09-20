@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 type File struct {
@@ -118,37 +117,19 @@ func AcquireRunLock() (*os.File, error) {
 			return f, nil
 		}
 		return nil, fmt.Errorf(
-			"could not acquire lock %s even after clearing stale file.\n  try:  rm -f %s && pkill -x marble-peer; marble-peer run",
-			LockPath(), LockPath(),
+			"could not acquire lock %s even after clearing stale file.\n  try:  %s",
+			LockPath(), staleLockHint(),
 		)
 	}
-	// Format kill help with full PIDs
 	parts := make([]string, len(live))
 	for i, p := range live {
 		parts[i] = strconv.Itoa(p)
 	}
 	list := strings.Join(parts, " ")
 	return nil, fmt.Errorf(
-		"another marble-peer is already running (pid %s).\n  stop it:  kill %s\n  or:       pkill -x marble-peer\n  force:    kill -9 %s; rm -f %s",
-		list, list, list, LockPath(),
+		"another marble-peer is already running (pid %s).\n%s",
+		list, runningHint(live),
 	)
-}
-
-func tryFlock() (*os.File, error) {
-	f, err := os.OpenFile(LockPath(), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	// Write PID only after we own the lock (do not truncate until then).
-	_ = f.Truncate(0)
-	_, _ = f.Seek(0, 0)
-	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
-	_ = f.Sync()
-	return f, nil
 }
 
 // findPeerHolders collects candidate PIDs: lock file contents, pgrep marble-peer, lock file openers.
@@ -228,15 +209,6 @@ func lockFileOpeners() []int {
 		}
 	}
 	return pids
-}
-
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	// Signal 0 checks existence without killing.
-	err := syscall.Kill(pid, 0)
-	return err == nil
 }
 
 func StatePath() string { return filepath.Join(Home(), "state.json") }

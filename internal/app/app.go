@@ -655,6 +655,10 @@ func notifyConfirm(prompt, risk, confirmURL string) uint32 {
 		_ = exec.Command("xdg-open", confirmURL).Start()
 	} else if runtime.GOOS == "darwin" {
 		_ = exec.Command("open", confirmURL).Start()
+	} else if runtime.GOOS == "windows" {
+		// Not `cmd /c start`: that re-parses & and % in the URL. The tray icon also
+		// raises a balloon notification when a confirmation appears.
+		_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", confirmURL).Start()
 	}
 	return notifID
 }

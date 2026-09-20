@@ -42,8 +42,11 @@ func Start(parent context.Context) *Guard {
 		return &Guard{done: make(chan struct{})}
 	}
 
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		return startCaffeinate(parent)
+	case "windows":
+		return startWindows(parent)
 	}
 
 	ctx, cancel := context.WithCancel(parent)

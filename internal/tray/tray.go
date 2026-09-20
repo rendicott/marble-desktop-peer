@@ -21,7 +21,8 @@ type Hooks struct {
 }
 
 // Start runs the platform tray until ctx is cancelled.
-// Linux: Python AppIndicator helper. macOS: Swift menu bar extra. Other OS: wait/no-op.
+// Linux: Python AppIndicator helper. macOS: Swift menu bar extra. Windows: PowerShell
+// notification-area icon. Other OS: wait/no-op.
 // Safe to call when HEADLESS / no DISPLAY — returns immediately.
 func Start(ctx context.Context, h Hooks) error {
 	if os.Getenv("MARBLE_PEER_NO_TRAY") == "1" {

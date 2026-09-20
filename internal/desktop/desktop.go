@@ -2,6 +2,7 @@
 //
 // Linux: GNOME/XWayland tools (grim, gnome-screenshot, xdotool).
 // macOS: screencapture + a compiled Swift helper (CGEvent) for click/type/key.
+// Windows: GDI screen capture + SendInput via user32/gdi32 (no CGO, no helpers).
 package desktop
 
 import (

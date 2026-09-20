@@ -149,6 +149,10 @@ func SyncUserProfile(src, dst string) error {
 	if err := os.MkdirAll(dst, 0o700); err != nil {
 		return err
 	}
+	if runtime.GOOS == "windows" {
+		// No rsync on Windows (and a Git-for-Windows rsync would read "C:\..." as host:path).
+		return syncProfileRobocopy(src, dst)
+	}
 	// Prefer rsync when available (fast incremental).
 	if _, err := exec.LookPath("rsync"); err == nil {
 		args := []string{
@@ -248,11 +252,24 @@ func chromeBinaryCandidates(goos string) []string {
 			"google-chrome", "chromium",
 		}
 	case "windows":
-		return []string{
+		var out []string
+		for _, root := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)"), os.Getenv("LOCALAPPDATA")} {
+			if root != "" {
+				out = append(out, filepath.Join(root, "Google", "Chrome", "Application", "chrome.exe"))
+			}
+		}
+		out = append(out,
 			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
 			`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
-			"chrome.exe", "msedge.exe",
+			"chrome.exe",
+		)
+		// Edge is Chromium with the same CDP flags and ships with Windows: last-resort fallback.
+		for _, root := range []string{os.Getenv("ProgramFiles(x86)"), os.Getenv("ProgramFiles")} {
+			if root != "" {
+				out = append(out, filepath.Join(root, "Microsoft", "Edge", "Application", "msedge.exe"))
+			}
 		}
+		return append(out, "msedge.exe")
 	default:
 		return []string{
 			"google-chrome-stable", "google-chrome", "chromium-browser", "chromium",
@@ -607,6 +624,9 @@ func discoverCDPPorts(preferred int, profile string) []int {
 
 // scanChromeDebugPortsFromProc finds --remote-debugging-port values on live Chrome processes.
 func scanChromeDebugPortsFromProc() []int {
+	if runtime.GOOS == "windows" {
+		return scanChromeDebugPortsWindows()
+	}
 	if runtime.GOOS != "linux" {
 		return scanChromeDebugPortsFromPS()
 	}
@@ -664,33 +684,7 @@ func scanChromeDebugPortsFromPS() []int {
 	if err != nil {
 		return nil
 	}
-	var ports []int
-	seen := map[int]bool{}
-	const key = "--remote-debugging-port="
-	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(strings.ToLower(line), "chrome") && !strings.Contains(strings.ToLower(line), "chromium") {
-			continue
-		}
-		if strings.Contains(line, "--type=") {
-			continue
-		}
-		idx := strings.Index(line, key)
-		if idx < 0 {
-			continue
-		}
-		rest := line[idx+len(key):]
-		end := 0
-		for end < len(rest) && rest[end] != 0 && rest[end] != ' ' && rest[end] != '\t' {
-			end++
-		}
-		p, err := strconv.Atoi(rest[:end])
-		if err != nil || p <= 0 || seen[p] {
-			continue
-		}
-		seen[p] = true
-		ports = append(ports, p)
-	}
-	return ports
+	return debugPortsFromCommandLines(strings.Split(string(out), "\n"), "chrome", "chromium")
 }
 
 func probeCDP(port int) bool {
@@ -2049,9 +2043,12 @@ func killProfileChrome(profile string) {
 	}
 	// Match main Chrome only when possible; fall back to user-data-dir match.
 	// GNU pkill accepts `--`; BSD (macOS) pkill does not.
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		_ = exec.Command("pkill", "-f", "user-data-dir="+profile).Run()
-	} else {
+	case "windows":
+		killProfileChromeWindows(profile)
+	default:
 		_ = exec.Command("pkill", "-f", "--", "user-data-dir="+profile).Run()
 	}
 	// Give SingletonLock time to clear
@@ -2082,6 +2079,20 @@ func PrintChromeCmd() string {
 	}
 	src := userChromeDataDir()
 	mirror := filepath.Join(config.Home(), "chrome-user-mirror")
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf(
+			`REM Chrome blocks remote debugging on the default profile path.
+REM Marble uses a *mirror* of your profile (cookies/logins) that supports CDP.
+REM Your daily Chrome at %s is left alone.
+REM
+REM Peer does this automatically via computer_browser_ensure.
+REM Manual equivalent (quit Chrome completely first so the Cookies file is not locked):
+robocopy "%s" "%s" /MIR /XJ /R:0 /W:0 /XD Cache "Code Cache" GPUCache "Crash Reports" /XF SingletonLock lockfile
+"%s" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --user-data-dir="%s"
+`,
+			src, src, mirror, bin, mirror,
+		)
+	}
 	return fmt.Sprintf(
 		`# Chrome blocks remote debugging on the default profile path.
 # Marble uses a *mirror* of your profile (cookies/logins) that supports CDP.

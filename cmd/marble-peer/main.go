@@ -139,7 +139,7 @@ Commands:
   status
   doctor [--open-settings] [--request-perms=false] [--screenshot=false]
   unpair
-  install-autostart [--no-enable]   # login start (LaunchAgent / systemd --user)
+  install-autostart [--no-enable]   # login start (LaunchAgent / systemd --user / Windows Startup)
   uninstall-autostart
   print-chrome-cmd
   version
@@ -152,6 +152,7 @@ Autostart:
   marble-peer install-autostart
   # Linux: systemctl --user status marble-peer
   # macOS: launchctl print gui/$(id -u)/com.rendicott.marble-peer
+  # Windows: Startup-folder launcher (no admin); log: %%USERPROFILE%%\.marble-peer\peer.log
   tail -f ~/.marble-peer/peer.log
 `)
 }
