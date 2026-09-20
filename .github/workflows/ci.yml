@@ -54,6 +54,7 @@ jobs:
           go test -count=1 -v -run 'Screenshot|Probe|InputStruct|InputInjection' ./internal/desktop
           go test -count=1 -v -run 'TrayScript|TrayHelper' ./internal/tray
           go test -count=1 -v -run 'TryFlock|PidAlive' ./internal/config
+          MARBLE_PEER_TEST_CHROME=1 go test -count=1 -v -run 'SyncProfileRobocopy|WindowsChromeLifecycle' ./internal/browser
 
   cross-build:
     name: Cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
