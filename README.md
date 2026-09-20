@@ -22,7 +22,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 ## Install (prebuilt)
 
-There is **no `.dmg`**, Homebrew formula, or App Store build. GitHub Actions publishes **unsigned portable binaries** on version tags (`v*`). Download from **[Releases](https://github.com/rendicott/marble-desktop-peer/releases)**.
+There is **no `.dmg`**, Homebrew formula, or App Store build. GitHub Actions publishes **unsigned portable binaries** (no Apple notarization, no Windows Authenticode signature) on version tags (`v*`). Download from **[Releases](https://github.com/rendicott/marble-desktop-peer/releases)**.
 
 | Asset | Platform |
 |-------|----------|
@@ -30,6 +30,10 @@ There is **no `.dmg`**, Homebrew formula, or App Store build. GitHub Actions pub
 | `marble-peer-linux-arm64` | Linux aarch64 |
 | `marble-peer-darwin-arm64` | macOS Apple Silicon |
 | `marble-peer-darwin-amd64` | macOS Intel |
+| `marble-peer-windows-amd64.exe` | Windows 10/11 x64 |
+| `marble-peer-windows-arm64.exe` | Windows 11 on ARM |
+
+Windows assets first ship in the release after v0.1.1 (see [CHANGELOG.md](CHANGELOG.md)); until then build from source (below).
 
 `v0.1.0`’s `darwin-arm64` asset was a Linux cross-compile and did **not** implement Mac desktop/Chrome. **v0.1.1+** is the first functional macOS peer.
 
@@ -96,6 +100,67 @@ tail -f ~/Library/Logs/marble-peer.log
 marble-peer uninstall-autostart
 ```
 
+### Windows
+
+Windows 10 / 11. Needs **Google Chrome** (Microsoft Edge is used as a fallback). Nothing else to install: screenshots use GDI and click/type/key use `SendInput` directly, so there are no helper tools, no CGO and no admin rights. The peer must run **inside your interactive desktop session** (Startup folder / a terminal you opened), not as a Windows service — a service has no desktop to capture.
+
+**1. Download, verify, and install** (PowerShell; use `arm64` on Windows on ARM):
+
+```powershell
+$ProgressPreference = 'SilentlyContinue'
+cd $HOME\Downloads
+$base = 'https://github.com/rendicott/marble-desktop-peer/releases/latest/download'
+Invoke-WebRequest "$base/marble-peer-windows-amd64.exe" -OutFile marble-peer-windows-amd64.exe
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+$want = ((Select-String -Path SHA256SUMS -Pattern 'marble-peer-windows-amd64.exe' -SimpleMatch).Line -split '\s+')[0]
+$got = (Get-FileHash marble-peer-windows-amd64.exe -Algorithm SHA256).Hash.ToLower()
+if ($got -ne $want) { throw "checksum mismatch: $got vs $want" }
+Unblock-File marble-peer-windows-amd64.exe
+New-Item -ItemType Directory -Force "$HOME\.local\bin" | Out-Null
+Move-Item -Force marble-peer-windows-amd64.exe "$HOME\.local\bin\marble-peer.exe"
+[Environment]::SetEnvironmentVariable('Path', "$([Environment]::GetEnvironmentVariable('Path','User'));$HOME\.local\bin", 'User')
+$env:Path += ";$HOME\.local\bin"
+```
+
+The Startup launcher records the exe's real path, so do **not** leave it in `Downloads`. Open a new terminal (or keep using this one) for `marble-peer` to resolve. The binary is unsigned: `Unblock-File` clears the download mark; if SmartScreen still says "Windows protected your PC", choose **More info → Run anyway**.
+
+**2. Probe the machine** (Chrome, screenshot, input, lock state):
+
+```powershell
+marble-peer version
+marble-peer doctor
+```
+
+**3. Pair with Marble, then run** (see [Pair](#pair-mutual-handshake)):
+
+```powershell
+marble-peer pair --harness https://YOUR-HARNESS --code HXXXXX
+marble-peer run
+```
+
+**4. Optional — start at login** (Startup-folder launcher `marble-peer.vbs`, runs hidden, no admin):
+
+```powershell
+marble-peer install-autostart
+Get-Content $HOME\.marble-peer\peer.log -Wait
+marble-peer uninstall-autostart
+```
+
+Behaviour worth knowing:
+
+| Topic | Windows behaviour |
+|-------|-------------------|
+| **Screen** | Primary display only. The process is made per-monitor DPI-aware, so screenshot pixels, the reported `screen_w`/`screen_h`, and click coordinates are all physical pixels (no 125%/150% scaling drift). |
+| **Elevated apps** | Windows blocks synthesized input into windows running as Administrator (UIPI). To drive an elevated window, start `marble-peer` from an elevated terminal. The screenshot still works either way. |
+| **Lock screen / UAC** | A locked workstation, the login screen and UAC prompts run on a secure desktop that cannot be captured or driven. `doctor`/status report `locked` (source `desktop`); the peer cannot unlock it. |
+| **Keep awake** | While running, the peer holds `SetThreadExecutionState(SYSTEM_REQUIRED\|DISPLAY_REQUIRED)` (disable with `MARBLE_PEER_KEEP_AWAKE=0`). That prevents idle sleep and display-off, but not a group-policy inactivity lock, Win+L, or closing the lid. |
+| **Key names** | `Return`, `Tab`, `Escape`, arrows, `F1`–`F24`, single characters, and chords such as `ctrl+shift+t`. `cmd+…` is treated as **Ctrl** (models emit macOS-style chords; `cmd+c` means copy). Use `win+…` / `super+…` for the Windows key. |
+| **Mouse buttons** | `1` left, `2` middle, `3` right; `4`/`5` scroll up/down (same convention as `xdotool click`). |
+| **Chrome profile mirror** | Uses `%LOCALAPPDATA%\Google\Chrome\User Data` → `%USERPROFILE%\.marble-peer\chrome-user-mirror` via `robocopy`. Chrome keeps its cookie database locked while running, so **quit Chrome completely before the first sync** (`computer_browser_ensure force=true`) or logins may be missing/stale; the peer logs when robocopy skipped files. |
+| **Tray** | Notification-area icon (PowerShell + WinForms): status, computer id, confirm prompts (balloon when one arrives), open mini UI, stop action, quit. Needs `powershell.exe`; if group policy blocks scripts the peer still runs (`MARBLE_PEER_NO_TRAY=1` silences the tray). |
+| **Data dir** | `%USERPROFILE%\.marble-peer` (`MARBLE_PEER_HOME`). Windows ignores POSIX file modes; the folder is private to your account through the default user-profile ACL. |
+| **Stop it** | Tray → **Quit**, `Ctrl+C` in its terminal, or `taskkill /IM marble-peer.exe`. |
+
 ### Linux
 
 ```bash
@@ -129,7 +194,7 @@ go build -o bin/marble-peer ./cmd/marble-peer
 ./bin/marble-peer version
 ```
 
-Requires **Go 1.18+** (CI release builds use **1.25.x**). Release binaries use `CGO_ENABLED=0` (no CGO; Linux uses shell tools, macOS compiles a Swift helper at first use).
+Requires **Go 1.18+** (CI release builds use **1.25.x**). Release binaries use `CGO_ENABLED=0` (no CGO; Linux uses shell tools, macOS compiles a Swift helper at first use, Windows calls Win32 directly). On Windows: `go build -o bin\marble-peer.exe .\cmd\marble-peer`; from any OS: `GOOS=windows GOARCH=amd64 go build -o marble-peer.exe ./cmd/marble-peer`.
 
 Optional ldflags (same as CI):
 
@@ -144,7 +209,7 @@ go build -ldflags "-s -w \
 ## Your logged-in Chrome (default)
 
 **Chrome 136+ blocks remote debugging on the default profile path**
-(Linux `~/.config/google-chrome`, macOS `~/Library/Application Support/Google/Chrome`).
+(Linux `~/.config/google-chrome`, macOS `~/Library/Application Support/Google/Chrome`, Windows `%LOCALAPPDATA%\Google\Chrome\User Data`).
 Passing `--remote-debugging-port` there will start Chrome but **never open a CDP port**.
 
 Marble’s default **`browser_mode=user`** therefore:
@@ -163,7 +228,7 @@ Notes:
 - Logins are as of the last sync (not a live attach to the daily window).
 - Re-run `computer_browser_ensure` / `force=true` after you log into new sites in daily Chrome.
 - Blank isolated profile: `marble-peer run --browser-mode marble`
-- Daily Chrome data dir: Linux `~/.config/google-chrome`, macOS `~/Library/Application Support/Google/Chrome`
+- Daily Chrome data dir: Linux `~/.config/google-chrome`, macOS `~/Library/Application Support/Google/Chrome`, Windows `%LOCALAPPDATA%\Google\Chrome\User Data`
 
 ## Pair (mutual handshake)
 
@@ -189,6 +254,10 @@ marble-peer run
 Mini UI (status / confirm): `http://127.0.0.1:18765` (or next free port; see `~/.marble-peer/state.json`).
 
 ## Autostart + system tray
+
+### Windows
+
+See the [Windows install](#windows) section: `marble-peer install-autostart` writes a hidden Startup-folder launcher, and `marble-peer run` shows a notification-area icon.
 
 ### Linux
 
@@ -266,8 +335,8 @@ marble-peer run --no-tray
 | `marble-peer run` | Long-running daemon (WS + actions + optional tray) |
 | `marble-peer status` | Local JSON status + desktop availability |
 | `marble-peer unpair` | Clear local computer id + device token |
-| `marble-peer install-autostart` / `uninstall-autostart` | Login start (Linux systemd --user / macOS LaunchAgent) |
-| `marble-peer doctor` | Local probe: Chrome, desktop tools, macOS TCC, screenshot |
+| `marble-peer install-autostart` / `uninstall-autostart` | Login start (Linux systemd --user / macOS LaunchAgent / Windows Startup folder) |
+| `marble-peer doctor` | Local probe: Chrome, desktop tools, lock state, macOS TCC, screenshot |
 | `marble-peer version` | Print version (release builds inject tag/commit/date) |
 
 ## Design & protocol
@@ -283,7 +352,7 @@ marble-peer run --no-tray
 ## Security
 
 - Mini UI binds **127.0.0.1** only  
-- Device token stored mode **0600** in `~/.marble-peer/credentials`  
+- Device token stored mode **0600** in `~/.marble-peer/credentials` (Windows: private to your account via the user-profile ACL)  
 - No cookie export; high-risk actions should use harness `computer_confirm`  
 - Do not commit `~/.marble-peer` or machine-specific harness URLs with secrets  
 
@@ -294,10 +363,10 @@ GitHub Actions builds on tags `v*` (and `workflow_dispatch` re-run). Same patter
 ```bash
 git tag -a v0.1.1 -m "v0.1.1"
 git push origin v0.1.1
-# Workflow "Release" tests on Linux + macOS, attaches assets
+# Workflow "Release" tests on Linux + macOS + Windows, attaches assets
 ```
 
-Linux binaries build on `ubuntu-latest`. Darwin binaries build on `macos-latest` (not cross-compiled from Linux). Unsigned portable files only — no `.dmg` or notarization.
+Linux binaries build on `ubuntu-latest`. Darwin binaries build on `macos-latest` (not cross-compiled from Linux). Windows binaries build on `windows-latest` (amd64 + arm64; `go test ./...` runs natively there). Unsigned portable files only — no `.dmg`, notarization or Authenticode signing.
 
 If a tag exists but the workflow failed: **Actions → Release → Run workflow** → enter tag (e.g. `v0.1.1`).
 

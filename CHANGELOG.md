@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added
+- **Windows peer** (`windows/amd64`, `windows/arm64`), pure Go with no CGO and no helper tools:
+  - screenshot via GDI `BitBlt`; click / type / key (chords, named keys, Unicode text) via `SendInput`; per-monitor DPI-aware so screenshot and click coordinates match
+  - lock / UAC / secure-desktop detection (`doctor`, status, screenshot lock warning)
+  - keep-awake via `SetThreadExecutionState`
+  - notification-area tray icon (PowerShell + WinForms) with confirm balloon
+  - `install-autostart` writes a hidden Startup-folder launcher (replaces the visible-console `.cmd` stub)
+  - Chrome/Edge discovery under Program Files and `%LOCALAPPDATA%`; profile mirror via `robocopy`; CDP port scan and mirror-only kill via PowerShell (no `ps`/`pkill`/`rsync`)
+  - single-instance lock (`LockFileEx`) and PID liveness check
+- CI runs `go test ./...` on `windows-latest` and cross-compiles Windows targets; the release workflow builds Windows assets on `windows-latest`.
+
+### Known limitations (Windows)
+- Input into elevated windows requires an elevated peer (UIPI); the lock screen / UAC prompt cannot be captured or driven.
+- Chrome locks its cookie database while running: quit Chrome before the first profile sync or mirror logins may be stale.
+- Primary display only (same as macOS).
+- Unsigned binary (SmartScreen prompt).
+
 ## [v0.1.1] — 2026-09-05
 
 First **functional macOS** peer. Darwin release assets are built on `macos-latest` (v0.1.0’s `darwin-arm64` was a Linux cross-compile without Mac desktop/Chrome paths). Still a portable unsigned binary — no `.dmg` or notarization.
