@@ -5,6 +5,7 @@ package autostart
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 )
@@ -85,32 +86,57 @@ func uninstallDarwin() ([]string, string, error) {
 	return []string{plist}, "unloaded and removed LaunchAgent", nil
 }
 
-func installWindows(exe string, enable bool) ([]string, string, error) {
-	// Startup folder .cmd is simple and needs no admin.
+func windowsStartupDir() (string, error) {
 	appData := os.Getenv("APPDATA")
 	if appData == "" {
-		return nil, "", fmt.Errorf("APPDATA not set")
+		return "", fmt.Errorf("APPDATA not set")
 	}
-	dir := filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+	return filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup"), nil
+}
+
+func installWindows(exe string, enable bool) ([]string, string, error) {
+	// Startup folder needs no admin and runs in the interactive session, which
+	// the desktop (screenshot/input) tools require; a Windows service would not.
+	dir, err := windowsStartupDir()
+	if err != nil {
+		return nil, "", err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, "", err
 	}
-	cmdPath := filepath.Join(dir, "marble-peer.cmd")
-	body := fmt.Sprintf("@echo off\r\nstart \"\" %q run\r\n", exe)
-	if err := os.WriteFile(cmdPath, []byte(body), 0o644); err != nil {
+	// An earlier build wrote marble-peer.cmd, which flashes a console window.
+	_ = os.Remove(filepath.Join(dir, "marble-peer.cmd"))
+	vbs := filepath.Join(dir, "marble-peer.vbs")
+	if err := os.WriteFile(vbs, utf16LEWithBOM(windowsLauncherVBS(exe)), 0o644); err != nil {
 		return nil, "", err
 	}
-	_ = enable
-	return []string{cmdPath}, "wrote Startup shortcut " + cmdPath, nil
+	msg := "wrote Startup launcher " + vbs
+	if enable {
+		if err := exec.Command("wscript.exe", "//B", vbs).Start(); err != nil {
+			return []string{vbs}, msg, fmt.Errorf("start now: %v", err)
+		}
+		msg += "\nstarted marble-peer in the background (a second copy exits on its own: single-instance lock)"
+	}
+	msg += "\nlog: " + filepath.Join(home(), ".marble-peer", "peer.log")
+	msg += "\nstop: right-click the Marble tray icon > Quit, or: taskkill /IM marble-peer.exe"
+	return []string{vbs}, msg, nil
 }
 
 func uninstallWindows() ([]string, string, error) {
-	appData := os.Getenv("APPDATA")
-	cmdPath := filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "marble-peer.cmd")
-	if err := os.Remove(cmdPath); err != nil && !os.IsNotExist(err) {
+	dir, err := windowsStartupDir()
+	if err != nil {
 		return nil, "", err
 	}
-	return []string{cmdPath}, "removed Startup entry", nil
+	var removed []string
+	for _, name := range []string{"marble-peer.vbs", "marble-peer.cmd"} {
+		p := filepath.Join(dir, name)
+		if err := os.Remove(p); err == nil {
+			removed = append(removed, p)
+		} else if !os.IsNotExist(err) {
+			return removed, "", err
+		}
+	}
+	return removed, "removed Startup entry (a running peer keeps running; quit it from the tray icon)", nil
 }
 
 // Stubs so autostart.go's runtime.GOOS switch links on non-linux targets.

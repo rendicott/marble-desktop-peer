@@ -1,6 +1,7 @@
 # Build and publish marble-peer binaries on version tags (v*).
 # Linux artifacts are built on ubuntu-latest; darwin artifacts on macos-latest
-# so the macOS helper sources compile in the same environment we ship for.
+# so the macOS helper sources compile in the same environment we ship for;
+# windows artifacts on windows-latest so the Win32 sources are tested natively.
 # Do not upload local binaries.
 name: Release
 
@@ -139,9 +140,57 @@ jobs:
           name: darwin-binaries
           path: dist/marble-peer-darwin-*
 
+  build-windows:
+    name: Build Windows
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.version.outputs.tag }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          VERSION: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PKG="github.com/rendicott/marble-desktop-peer/internal/app"
+          LDFLAGS="-s -w -X ${PKG}.PeerVersion=${VERSION} -X ${PKG}.Commit=${COMMIT} -X ${PKG}.Date=${DATE}"
+          for arch in amd64 arm64; do
+            out="dist/marble-peer-windows-${arch}.exe"
+            echo "Building ${out}…"
+            CGO_ENABLED=0 GOOS=windows GOARCH="$arch" \
+              go build -trimpath -ldflags "$LDFLAGS" \
+              -o "$out" ./cmd/marble-peer
+          done
+          ls -la dist
+          ./dist/marble-peer-windows-amd64.exe version
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: dist/marble-peer-windows-*.exe
+
   release:
     name: Publish GitHub Release
-    needs: [version, build-linux, build-darwin]
+    needs: [version, build-linux, build-darwin, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -172,11 +221,13 @@ jobs:
             dist/marble-peer-linux-arm64
             dist/marble-peer-darwin-arm64
             dist/marble-peer-darwin-amd64
+            dist/marble-peer-windows-amd64.exe
+            dist/marble-peer-windows-arm64.exe
             dist/SHA256SUMS
           body: |
-            Pre-built **marble-peer** binaries built on **GitHub Actions** (`CGO_ENABLED=0`). Unsigned portable files — **no `.dmg` or notarization**.
+            Pre-built **marble-peer** binaries built on **GitHub Actions** (`CGO_ENABLED=0`). Unsigned portable files — **no `.dmg`, notarization or Authenticode signing**.
 
-            Linux targets compile on `ubuntu-latest`. macOS targets compile on `macos-latest` (not Linux cross-compile).
+            Linux targets compile on `ubuntu-latest`. macOS targets compile on `macos-latest` (not Linux cross-compile). Windows targets compile on `windows-latest`.
 
             Desktop agent for [Marble](https://github.com/rendicott/marble) remote computer-use (ADR-0020 / ADR-0021).
 
@@ -186,6 +237,8 @@ jobs:
             | `marble-peer-linux-arm64` | Linux aarch64 |
             | `marble-peer-darwin-arm64` | macOS Apple Silicon |
             | `marble-peer-darwin-amd64` | macOS Intel |
+            | `marble-peer-windows-amd64.exe` | Windows 10/11 x64 |
+            | `marble-peer-windows-arm64.exe` | Windows 11 on ARM |
 
             ```bash
             curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/marble-peer-darwin-arm64
@@ -197,8 +250,18 @@ jobs:
             ./marble-peer-darwin-arm64 doctor
             ```
 
+            ```powershell
+            # Windows (PowerShell)
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest https://github.com/rendicott/marble-desktop-peer/releases/latest/download/marble-peer-windows-amd64.exe -OutFile marble-peer.exe
+            Unblock-File .\marble-peer.exe
+            .\marble-peer.exe version
+            .\marble-peer.exe doctor
+            ```
+
             **Linux desktop tools (recommended):** `xdotool`, `gnome-screenshot` (or ImageMagick `import`).
             **macOS install:** `chmod +x` → `xattr -d com.apple.quarantine` (unsigned download) → move to `~/.local/bin/marble-peer` → `marble-peer doctor --open-settings` → grant **Screen Recording** and **Accessibility**. See the [README](https://github.com/rendicott/marble-desktop-peer#readme).
+            **Windows install:** no extra packages; see the [README](https://github.com/rendicott/marble-desktop-peer#windows) (unsigned binary: SmartScreen may ask you to confirm; input into elevated windows needs an elevated peer).
             **Chrome** required for browser automation (CDP mirror profile under `~/.marble-peer`).
 
             See the [README](https://github.com/rendicott/marble-desktop-peer#readme) for pair, run, tray, and autostart.

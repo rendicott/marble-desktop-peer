@@ -11,14 +11,17 @@ import (
 // LockState reports whether the session appears locked / on greeter.
 type LockState struct {
 	Locked bool   `json:"locked"`
-	Source string `json:"source,omitempty"` // screensaver|loginctl|unknown
+	Source string `json:"source,omitempty"` // screensaver|loginctl|ioreg|desktop|unknown
 	Detail string `json:"detail,omitempty"`
 }
 
 // QueryLockState best-effort detects session lock screens.
 func QueryLockState(ctx context.Context) LockState {
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		return queryLockDarwin(ctx)
+	case "windows":
+		return queryLockWindows(ctx)
 	}
 	// org.gnome.ScreenSaver.GetActive
 	for _, dest := range []struct {

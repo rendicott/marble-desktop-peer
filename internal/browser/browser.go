@@ -3,6 +3,7 @@ package browser
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -137,6 +138,40 @@ func chromeDataDirCandidates(goos, home string) []string {
 // UserChromeDir is the daily Chrome profile marble mirrors (ModeUser).
 func UserChromeDir() string { return userChromeDataDir() }
 
+// ErrCookiesLocked means a profile sync finished (possibly reporting overall
+// success) but the mirror's cookie database was not actually updated because
+// Chrome is running and holds it locked. Local State (the cookie encryption
+// key) copies fine since it is not kept open, so a mirror in this state would
+// launch with a valid key and zero logins — a silent failure. Callers should
+// treat this as a hard sync failure rather than proceeding.
+var ErrCookiesLocked = errors.New("chrome is running and holds the cookie database locked")
+
+// cookiesRelPath is the Chrome/Chromium cookie database, relative to the
+// profile root (holds the actual logins; Local State only holds the key
+// that decrypts them).
+const cookiesRelPath = "Default/Network/Cookies"
+
+// verifyCookiesSynced fails the sync when the source profile has a real
+// cookie database but the mirror's copy is missing or empty. That happens
+// when Chrome is running and keeps Default\Network\Cookies exclusively
+// locked, so robocopy/rsync/copyDir silently skip it while still copying
+// everything else (including Local State, the encryption key) — the mirror
+// would then have a working key but no logins at all. Other locked files
+// (Sessions, Cookies-journal, etc.) are not checked here and stay tolerated.
+func verifyCookiesSynced(src, dst string) error {
+	rel := filepath.FromSlash(cookiesRelPath)
+	srcInfo, err := os.Stat(filepath.Join(src, rel))
+	if err != nil || srcInfo.Size() == 0 {
+		return nil // source has no real cookie DB (fresh profile, etc.) — nothing to verify
+	}
+	dstInfo, err := os.Stat(filepath.Join(dst, rel))
+	if err != nil || dstInfo.Size() == 0 {
+		return fmt.Errorf("%s was not synced: %w (mirror would have zero logins); "+
+			"fully quit Chrome, then run computer_browser_ensure force=true", cookiesRelPath, ErrCookiesLocked)
+	}
+	return nil
+}
+
 // SyncUserProfile copies logins/cookies from the daily Chrome dir into the mirror.
 // Safe while daily Chrome is running for most files; best after force (daily Chrome quit).
 func SyncUserProfile(src, dst string) error {
@@ -148,6 +183,13 @@ func SyncUserProfile(src, dst string) error {
 	}
 	if err := os.MkdirAll(dst, 0o700); err != nil {
 		return err
+	}
+	if runtime.GOOS == "windows" {
+		// No rsync on Windows (and a Git-for-Windows rsync would read "C:\..." as host:path).
+		if err := syncProfileRobocopy(src, dst); err != nil {
+			return err
+		}
+		return verifyCookiesSynced(src, dst)
 	}
 	// Prefer rsync when available (fast incremental).
 	if _, err := exec.LookPath("rsync"); err == nil {
@@ -171,11 +213,14 @@ func SyncUserProfile(src, dst string) error {
 		if err != nil {
 			return fmt.Errorf("rsync: %v: %s", err, string(out))
 		}
-		return nil
+		return verifyCookiesSynced(src, dst)
 	}
 	// Fallback: copy Local State + Default (cookies, local storage)
 	_ = copyFile(filepath.Join(src, "Local State"), filepath.Join(dst, "Local State"))
-	return copyDir(filepath.Join(src, "Default"), filepath.Join(dst, "Default"))
+	if err := copyDir(filepath.Join(src, "Default"), filepath.Join(dst, "Default")); err != nil {
+		return err
+	}
+	return verifyCookiesSynced(src, dst)
 }
 
 func copyFile(src, dst string) error {
@@ -248,11 +293,24 @@ func chromeBinaryCandidates(goos string) []string {
 			"google-chrome", "chromium",
 		}
 	case "windows":
-		return []string{
+		var out []string
+		for _, root := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)"), os.Getenv("LOCALAPPDATA")} {
+			if root != "" {
+				out = append(out, filepath.Join(root, "Google", "Chrome", "Application", "chrome.exe"))
+			}
+		}
+		out = append(out,
 			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
 			`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
-			"chrome.exe", "msedge.exe",
+			"chrome.exe",
+		)
+		// Edge is Chromium with the same CDP flags and ships with Windows: last-resort fallback.
+		for _, root := range []string{os.Getenv("ProgramFiles(x86)"), os.Getenv("ProgramFiles")} {
+			if root != "" {
+				out = append(out, filepath.Join(root, "Microsoft", "Edge", "Application", "msedge.exe"))
+			}
 		}
+		return append(out, "msedge.exe")
 	default:
 		return []string{
 			"google-chrome-stable", "google-chrome", "chromium-browser", "chromium",
@@ -323,6 +381,11 @@ func (m *Manager) Ensure(ctx context.Context, force bool) (EnsureResult, error) 
 			m.mu.Unlock()
 		}
 		if err := SyncUserProfile(m.sourceDir, m.profile); err != nil {
+			if errors.Is(err, ErrCookiesLocked) {
+				// Hard failure: launching now would silently give zero logins.
+				res.Message = err.Error()
+				return res, err
+			}
 			// soft: continue with existing mirror if any
 			res.Message = "profile sync warning: " + err.Error()
 		} else {
@@ -607,6 +670,9 @@ func discoverCDPPorts(preferred int, profile string) []int {
 
 // scanChromeDebugPortsFromProc finds --remote-debugging-port values on live Chrome processes.
 func scanChromeDebugPortsFromProc() []int {
+	if runtime.GOOS == "windows" {
+		return scanChromeDebugPortsWindows()
+	}
 	if runtime.GOOS != "linux" {
 		return scanChromeDebugPortsFromPS()
 	}
@@ -664,33 +730,7 @@ func scanChromeDebugPortsFromPS() []int {
 	if err != nil {
 		return nil
 	}
-	var ports []int
-	seen := map[int]bool{}
-	const key = "--remote-debugging-port="
-	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(strings.ToLower(line), "chrome") && !strings.Contains(strings.ToLower(line), "chromium") {
-			continue
-		}
-		if strings.Contains(line, "--type=") {
-			continue
-		}
-		idx := strings.Index(line, key)
-		if idx < 0 {
-			continue
-		}
-		rest := line[idx+len(key):]
-		end := 0
-		for end < len(rest) && rest[end] != 0 && rest[end] != ' ' && rest[end] != '\t' {
-			end++
-		}
-		p, err := strconv.Atoi(rest[:end])
-		if err != nil || p <= 0 || seen[p] {
-			continue
-		}
-		seen[p] = true
-		ports = append(ports, p)
-	}
-	return ports
+	return debugPortsFromCommandLines(strings.Split(string(out), "\n"), "chrome", "chromium")
 }
 
 func probeCDP(port int) bool {
@@ -2049,9 +2089,12 @@ func killProfileChrome(profile string) {
 	}
 	// Match main Chrome only when possible; fall back to user-data-dir match.
 	// GNU pkill accepts `--`; BSD (macOS) pkill does not.
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		_ = exec.Command("pkill", "-f", "user-data-dir="+profile).Run()
-	} else {
+	case "windows":
+		killProfileChromeWindows(profile)
+	default:
 		_ = exec.Command("pkill", "-f", "--", "user-data-dir="+profile).Run()
 	}
 	// Give SingletonLock time to clear
@@ -2082,6 +2125,20 @@ func PrintChromeCmd() string {
 	}
 	src := userChromeDataDir()
 	mirror := filepath.Join(config.Home(), "chrome-user-mirror")
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf(
+			`REM Chrome blocks remote debugging on the default profile path.
+REM Marble uses a *mirror* of your profile (cookies/logins) that supports CDP.
+REM Your daily Chrome at %s is left alone.
+REM
+REM Peer does this automatically via computer_browser_ensure.
+REM Manual equivalent (quit Chrome completely first so the Cookies file is not locked):
+robocopy "%s" "%s" /MIR /XJ /R:0 /W:0 /XD Cache "Code Cache" GPUCache "Crash Reports" /XF SingletonLock lockfile
+"%s" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --user-data-dir="%s"
+`,
+			src, src, mirror, bin, mirror,
+		)
+	}
 	return fmt.Sprintf(
 		`# Chrome blocks remote debugging on the default profile path.
 # Marble uses a *mirror* of your profile (cookies/logins) that supports CDP.
