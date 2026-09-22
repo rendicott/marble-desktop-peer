@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## [v0.1.2] — 2026-09-22
+
+First release with **Windows** assets. The Windows peer needs an **interactive desktop session** — see the callout below and the README Windows section.
+
+> **Windows: plain SSH is not enough.** OpenSSH on Windows lands your shell in **session 0**, the non-interactive "Services" session, which has no desktop at all. Screenshot and input are structurally impossible there (not merely blocked by a lock). Install over SSH if you like, but *run* the peer from an interactive session — a console/RDP session, `install-autostart`, or a scheduled task created with `schtasks ... /it`. `doctor` detects this and says so (`lock: locked=true source=session`).
 
 ### Added
 - **Windows peer** (`windows/amd64`, `windows/arm64`), pure Go with no CGO and no helper tools:
@@ -25,6 +29,7 @@
 - SSH alone lands in session 0 (no interactive desktop); run from an interactive session (console/RDP) or a scheduled task with `/it` — see the README Windows section.
 - Primary display only (same as macOS).
 - Unsigned binary (SmartScreen prompt).
+- Windows on ARM is cross-compiled only (not run on ARM hardware).
 
 ## [v0.1.1] — 2026-09-05
 
@@ -68,5 +73,6 @@ First public release of **marble-peer** (desktop agent for [Marble](https://gith
   a 2s cache on desktop/browser probes inside `StatusJSON()`.  
   Details: [docs/idle-cpu-status-storm.md](docs/idle-cpu-status-storm.md).
 
+[v0.1.2]: https://github.com/rendicott/marble-desktop-peer/releases/tag/v0.1.2
 [v0.1.1]: https://github.com/rendicott/marble-desktop-peer/releases/tag/v0.1.1
 [v0.1.0]: https://github.com/rendicott/marble-desktop-peer/releases/tag/v0.1.0

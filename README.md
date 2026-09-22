@@ -8,15 +8,16 @@ Gives the Marble harness **remote hands and eyes** on your personal machine: ful
 |--|--|
 | **Binary** | `marble-peer` |
 | **Module** | `github.com/rendicott/marble-desktop-peer` |
-| **Latest release** | **[v0.1.1](https://github.com/rendicott/marble-desktop-peer/releases/tag/v0.1.1)** |
+| **Latest release** | **[v0.1.2](https://github.com/rendicott/marble-desktop-peer/releases/tag/v0.1.2)** |
 | **Data dir** | `~/.marble-peer` (`MARBLE_PEER_HOME`) |
 | **Harness** | Marble ≥ **v0.4.1** (computers registry + peer hub) |
 
-## What's new in v0.1.1
+## What's new in v0.1.2
 
-- **macOS desktop control** (screenshot, click, type, key), Chrome profile paths, LaunchAgent, menu bar tray  
-- `marble-peer doctor` for local permissions / Chrome / screenshot probe  
-- Darwin release binaries built on **GitHub-hosted macOS** (not Linux cross-compile)  
+- **Windows peer** (`windows/amd64`, `windows/arm64`) — GDI screenshots, `SendInput` click/type/key, DPI-aware coordinates, tray, autostart, Chrome/Edge mirror. Pure Go, no CGO, no helper tools.  
+- **Windows needs an interactive session.** Plain SSH lands in session 0, which has no desktop — see the callout in the Windows section below.  
+- Fixed: the Chrome profile mirror now **fails loudly** instead of silently launching with zero logins when Chrome holds the cookie DB locked.  
+- `doctor` distinguishes a non-interactive session from a locked screen and tells you which fix applies.  
 
 See [CHANGELOG.md](CHANGELOG.md).
 
@@ -33,7 +34,7 @@ There is **no `.dmg`**, Homebrew formula, or App Store build. GitHub Actions pub
 | `marble-peer-windows-amd64.exe` | Windows 10/11 x64 |
 | `marble-peer-windows-arm64.exe` | Windows 11 on ARM |
 
-Windows assets first ship in the release after v0.1.1 (see [CHANGELOG.md](CHANGELOG.md)); until then build from source (below).
+Windows assets ship from **v0.1.2** onward. `v0.1.0`/`v0.1.1` have no Windows asset.
 
 `v0.1.0`’s `darwin-arm64` asset was a Linux cross-compile and did **not** implement Mac desktop/Chrome. **v0.1.1+** is the first functional macOS peer.
 
@@ -211,7 +212,7 @@ Optional ldflags (same as CI):
 
 ```bash
 go build -ldflags "-s -w \
-  -X github.com/rendicott/marble-desktop-peer/internal/app.PeerVersion=v0.1.1 \
+  -X github.com/rendicott/marble-desktop-peer/internal/app.PeerVersion=v0.1.2 \
   -X github.com/rendicott/marble-desktop-peer/internal/app.Commit=$(git rev-parse --short HEAD) \
   -X github.com/rendicott/marble-desktop-peer/internal/app.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   -o bin/marble-peer ./cmd/marble-peer
@@ -372,14 +373,14 @@ marble-peer run --no-tray
 GitHub Actions builds on tags `v*` (and `workflow_dispatch` re-run). Same pattern as [marble-harness](https://github.com/rendicott/marble).
 
 ```bash
-git tag -a v0.1.1 -m "v0.1.1"
-git push origin v0.1.1
+git tag -a v0.1.2 -m "v0.1.2"
+git push origin v0.1.2
 # Workflow "Release" tests on Linux + macOS + Windows, attaches assets
 ```
 
 Linux binaries build on `ubuntu-latest`. Darwin binaries build on `macos-latest` (not cross-compiled from Linux). Windows binaries build on `windows-latest` (amd64 + arm64; `go test ./...` runs natively there). Unsigned portable files only — no `.dmg`, notarization or Authenticode signing.
 
-If a tag exists but the workflow failed: **Actions → Release → Run workflow** → enter tag (e.g. `v0.1.1`).
+If a tag exists but the workflow failed: **Actions → Release → Run workflow** → enter tag (e.g. `v0.1.2`).
 
 Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
