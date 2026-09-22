@@ -118,6 +118,15 @@ Windows 10 / 11. Needs **Google Chrome** (Microsoft Edge is used as a fallback).
 
 **1. Download, verify, and install** (PowerShell; use `arm64` on Windows on ARM):
 
+> **Windows Defender may quarantine the binary.** It is unsigned, and Defender's ML heuristic flags it as `Trojan:Win32/Bearfoos.A!ml` (the `!ml` suffix means a shape-based guess, not a signature match) because it captures the screen, injects input and enumerates processes — the same behavioural profile as `xdotool`/AutoHotkey. Defender **deletes the file**, so `marble-peer.exe` vanishes and every command fails with "not recognized". Add an exclusion for the install directory first (admin PowerShell), then install:
+>
+> ```powershell
+> # ADMIN PowerShell — exclude only the install dir, not the whole system
+> Add-MpPreference -ExclusionPath "$env:USERPROFILE\.local\bin"
+> ```
+>
+> See [Windows Defender](#windows-defender) below for details and the false-positive submission link.
+
 ```powershell
 $ProgressPreference = 'SilentlyContinue'
 cd $HOME\Downloads
@@ -134,7 +143,7 @@ Move-Item -Force marble-peer-windows-amd64.exe "$HOME\.local\bin\marble-peer.exe
 $env:Path += ";$HOME\.local\bin"
 ```
 
-The Startup launcher records the exe's real path, so do **not** leave it in `Downloads`. Open a new terminal (or keep using this one) for `marble-peer` to resolve. The binary is unsigned: `Unblock-File` clears the download mark; if SmartScreen still says "Windows protected your PC", choose **More info → Run anyway**.
+The Startup launcher records the exe's real path, so do **not** leave it in `Downloads`. Open a new terminal (or keep using this one) for `marble-peer` to resolve. The binary is unsigned: `Unblock-File` clears the download mark; if SmartScreen still says "Windows protected your PC", choose **More info → Run anyway**. Defender is a separate and more aggressive problem — see [Windows Defender](#windows-defender).
 
 **2. Probe the machine** (Chrome, screenshot, input, lock state):
 
@@ -196,6 +205,63 @@ sudo apt install xdotool gnome-screenshot
 # AppIndicator tray (Ubuntu often has this already):
 # sudo apt install gir1.2-ayatanaappindicator3-0.1
 ```
+
+## Windows Defender
+
+The Windows binary is **unsigned**, and Microsoft Defender's machine-learning heuristic flags it as:
+
+```
+Trojan:Win32/Bearfoos.A!ml
+```
+
+The `!ml` suffix means this is a **shape-based guess, not a signature match** — no known malware was identified. Defender flags the binary because of what the peer legitimately does: capture the screen, inject synthetic input, enumerate processes, and copy a browser profile. That behavioural profile is indistinguishable from spyware to a heuristic model, and it is the same reason `xdotool`, AutoHotkey and similar automation tools get flagged.
+
+**The failure mode is confusing:** Defender does not warn and let you click through — it **deletes the file**. So `marble-peer.exe` disappears, and every subsequent command fails with `The term 'marble-peer' is not recognized`, which looks like a PATH problem rather than a quarantine.
+
+### Confirm it was Defender
+
+```powershell
+Get-MpThreatDetection | Select-Object -Last 5 | Format-List ThreatID,Resources,InitialDetectionTime
+Get-MpThreat | Select-Object ThreatName,SeverityID,IsActive | Format-List
+```
+
+If you see `Trojan:Win32/Bearfoos.A!ml` pointing at your `marble-peer.exe`, that is this false positive.
+
+### Fix: exclude the install directory
+
+Run in an **admin** PowerShell. Scope the exclusion to the install directory rather than disabling protection or excluding a whole drive:
+
+```powershell
+Add-MpPreference -ExclusionPath "$env:USERPROFILE\.local\bin"
+```
+
+Then re-download and install (Defender already deleted the file):
+
+```powershell
+$ProgressPreference = 'SilentlyContinue'
+$base = 'https://github.com/rendicott/marble-desktop-peer/releases/latest/download'
+Invoke-WebRequest "$base/marble-peer-windows-amd64.exe" -OutFile "$env:USERPROFILE\.local\bin\marble-peer.exe"
+Unblock-File "$env:USERPROFILE\.local\bin\marble-peer.exe"
+& "$env:USERPROFILE\.local\bin\marble-peer.exe" version
+```
+
+Verify the download against the published checksum before trusting it — see step 1 in the [Windows install](#windows) section.
+
+To undo the exclusion later:
+
+```powershell
+Remove-MpPreference -ExclusionPath "$env:USERPROFILE\.local\bin"
+```
+
+### Report it as a false positive
+
+Worth doing so future releases stop getting flagged for everyone:
+
+<https://www.microsoft.com/en-us/wdsi/filesubmission> — submit the file as **software developer → incorrect detection**.
+
+### The permanent fix
+
+An **Authenticode code-signing certificate** removes this class of problem entirely (and the SmartScreen prompt with it). Options include a standard OV/EV certificate from a commercial CA, or [Azure Trusted Signing](https://learn.microsoft.com/en-us/azure/trusted-signing/) if you qualify. Until then, the exclusion above is the workaround.
 
 ## Build from source
 

@@ -28,7 +28,7 @@ First release with **Windows** assets. The Windows peer needs an **interactive d
 - Input into elevated windows requires an elevated peer (UIPI); the lock screen / UAC prompt cannot be captured or driven.
 - SSH alone lands in session 0 (no interactive desktop); run from an interactive session (console/RDP) or a scheduled task with `/it` — see the README Windows section.
 - Primary display only (same as macOS).
-- Unsigned binary (SmartScreen prompt).
+- Unsigned binary: SmartScreen prompt, and **Defender's ML heuristic quarantines it** as `Trojan:Win32/Bearfoos.A!ml` (false positive — it deletes the file, so commands fail with "not recognized"). Add an exclusion for the install dir; see the README [Windows Defender](../README.md#windows-defender) section.
 - Windows on ARM is cross-compiled only (not run on ARM hardware).
 
 ## [v0.1.1] — 2026-09-05
