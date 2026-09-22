@@ -102,7 +102,18 @@ marble-peer uninstall-autostart
 
 ### Windows
 
-Windows 10 / 11. Needs **Google Chrome** (Microsoft Edge is used as a fallback). Nothing else to install: screenshots use GDI and click/type/key use `SendInput` directly, so there are no helper tools, no CGO and no admin rights. The peer must run **inside your interactive desktop session** (Startup folder / a terminal you opened), not as a Windows service — a service has no desktop to capture.
+Windows 10 / 11. Needs **Google Chrome** (Microsoft Edge is used as a fallback). Nothing else to install: screenshots use GDI and click/type/key use `SendInput` directly, so there are no helper tools, no CGO and no admin rights. The peer must run **inside an interactive desktop session** (Startup folder / a terminal you opened at the console or over RDP), not as a Windows service — a service has no desktop to capture.
+
+> **Setting this up over plain SSH?** OpenSSH on Windows lands your shell in **session 0**, the non-interactive "Services" session — there is no desktop there at all, so screenshot and input are structurally impossible, not just locked. `doctor` reports it plainly (`lock: locked=true source=session ...`) rather than the generic secure-desktop message. SSH in to install the binary, but *launch* and *run doctor* via a scheduled task started into the interactive session (`/it`) instead of directly from the SSH shell:
+>
+> ```powershell
+> schtasks /create /tn marble-peer-doctor /tr "$HOME\.local\bin\marble-peer.exe doctor --screenshot" /sc onstart /ru "$env:USERNAME" /it /rl highest /f
+> schtasks /run /tn marble-peer-doctor
+> Get-Content "$HOME\.marble-peer\peer.log" -Tail 40  # or redirect doctor's stdout yourself
+> schtasks /delete /tn marble-peer-doctor /f
+> ```
+>
+> Do the same for `marble-peer run` (or use `marble-peer install-autostart`, step 4 below, so it starts in the interactive session automatically at every login — no scheduled task needed). `/it` is the part that matters: it runs the task in the active interactive session (1) instead of session 0. A real console or RDP session works too — only a bare SSH shell is session 0.
 
 **1. Download, verify, and install** (PowerShell; use `arm64` on Windows on ARM):
 
@@ -152,11 +163,11 @@ Behaviour worth knowing:
 |-------|-------------------|
 | **Screen** | Primary display only. The process is made per-monitor DPI-aware, so screenshot pixels, the reported `screen_w`/`screen_h`, and click coordinates are all physical pixels (no 125%/150% scaling drift). |
 | **Elevated apps** | Windows blocks synthesized input into windows running as Administrator (UIPI). To drive an elevated window, start `marble-peer` from an elevated terminal. The screenshot still works either way. |
-| **Lock screen / UAC** | A locked workstation, the login screen and UAC prompts run on a secure desktop that cannot be captured or driven. `doctor`/status report `locked` (source `desktop`); the peer cannot unlock it. |
+| **Lock screen / UAC** | A locked workstation, the login screen and UAC prompts run on a secure desktop that cannot be captured or driven. `doctor`/status report `locked` (source `desktop`); the peer cannot unlock it. A **non-interactive session** (source `session`, typically a plain SSH shell landing in session 0 — see the callout above) looks similar but needs a different fix: run from an interactive session instead. |
 | **Keep awake** | While running, the peer holds `SetThreadExecutionState(SYSTEM_REQUIRED\|DISPLAY_REQUIRED)` (disable with `MARBLE_PEER_KEEP_AWAKE=0`). That prevents idle sleep and display-off, but not a group-policy inactivity lock, Win+L, or closing the lid. |
 | **Key names** | `Return`, `Tab`, `Escape`, arrows, `F1`–`F24`, single characters, and chords such as `ctrl+shift+t`. `cmd+…` is treated as **Ctrl** (models emit macOS-style chords; `cmd+c` means copy). Use `win+…` / `super+…` for the Windows key. |
 | **Mouse buttons** | `1` left, `2` middle, `3` right; `4`/`5` scroll up/down (same convention as `xdotool click`). |
-| **Chrome profile mirror** | Uses `%LOCALAPPDATA%\Google\Chrome\User Data` → `%USERPROFILE%\.marble-peer\chrome-user-mirror` via `robocopy`. Chrome keeps its cookie database locked while running, so **quit Chrome completely before the first sync** (`computer_browser_ensure force=true`) or logins may be missing/stale; the peer logs when robocopy skipped files. |
+| **Chrome profile mirror** | Uses `%LOCALAPPDATA%\Google\Chrome\User Data` → `%USERPROFILE%\.marble-peer\chrome-user-mirror` via `robocopy`. Chrome keeps its cookie database locked while running, so **quit Chrome completely before the first sync** — if the mirror's `Default\Network\Cookies` would end up missing/empty because Chrome is still open, the sync now fails loudly instead of silently launching a mirror with zero logins; quit Chrome and retry with `computer_browser_ensure force=true`. |
 | **Tray** | Notification-area icon (PowerShell + WinForms): status, computer id, confirm prompts (balloon when one arrives), open mini UI, stop action, quit. Needs `powershell.exe`; if group policy blocks scripts the peer still runs (`MARBLE_PEER_NO_TRAY=1` silences the tray). |
 | **Data dir** | `%USERPROFILE%\.marble-peer` (`MARBLE_PEER_HOME`). Windows ignores POSIX file modes; the folder is private to your account through the default user-profile ACL. |
 | **Stop it** | Tray → **Quit**, `Ctrl+C` in its terminal, or `taskkill /IM marble-peer.exe`. |
