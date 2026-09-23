@@ -8,6 +8,11 @@ type Caps struct {
 	Browser bool `json:"browser"`
 	Desktop bool `json:"desktop"`
 	Confirm bool `json:"confirm"`
+	// Exec advertises computer_exec support (run a shell command on the peer,
+	// return stdout/stderr/exit_code as text) — added per field report
+	// peer-gui-loop-report (2026-09-23) so state (files, logs, config) is
+	// legible without reading screenshot pixels.
+	Exec bool `json:"exec"`
 }
 
 type Envelope struct {

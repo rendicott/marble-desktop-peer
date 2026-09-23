@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/png"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 	"unicode"
@@ -35,6 +36,10 @@ var (
 	procSendInput                     = user32.NewProc("SendInput")
 	procVkKeyScanW                    = user32.NewProc("VkKeyScanW")
 	procMapVirtualKeyW                = user32.NewProc("MapVirtualKeyW")
+	procGetForegroundWindow           = user32.NewProc("GetForegroundWindow")
+	procGetWindowTextW                = user32.NewProc("GetWindowTextW")
+	procGetWindowTextLengthW          = user32.NewProc("GetWindowTextLengthW")
+	procGetWindowThreadProcessId      = user32.NewProc("GetWindowThreadProcessId")
 
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
 	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
@@ -43,6 +48,12 @@ var (
 	procGetDIBits              = gdi32.NewProc("GetDIBits")
 	procDeleteObject           = gdi32.NewProc("DeleteObject")
 	procDeleteDC               = gdi32.NewProc("DeleteDC")
+
+	// kernel32 itself is declared once in lock_windows.go (same package, same
+	// build tag) — reused here for the new procs below.
+	procOpenProcess                = kernel32.NewProc("OpenProcess")
+	procCloseHandle                = kernel32.NewProc("CloseHandle")
+	procQueryFullProcessImageNameW = kernel32.NewProc("QueryFullProcessImageNameW")
 )
 
 func init() {
@@ -380,6 +391,48 @@ func keyOS(ctx context.Context, key string) error {
 		return fmt.Errorf("key %q: %w", key, err)
 	}
 	return nil
+}
+
+const processQueryLimitedInformation = 0x1000
+
+// activeWindowOS returns the foreground window's title and its owning
+// process's executable name (closest Windows analog to an "app name").
+func activeWindowOS(ctx context.Context) (title, app string, err error) {
+	_ = ctx
+	hwnd, _, _ := procGetForegroundWindow.Call()
+	if hwnd == 0 {
+		return "", "", fmt.Errorf("GetForegroundWindow: no foreground window")
+	}
+	if ln, _, _ := procGetWindowTextLengthW.Call(hwnd); ln > 0 {
+		buf := make([]uint16, ln+1)
+		procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		title = syscall.UTF16ToString(buf)
+	}
+	var pid uint32
+	procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+	if pid != 0 {
+		app = processNameByPID(pid)
+	}
+	return title, app, nil
+}
+
+// processNameByPID resolves a PID to its executable base name via
+// QueryFullProcessImageNameW (Vista+). Returns "" on any failure — this is
+// advisory metadata, never worth failing the caller over.
+func processNameByPID(pid uint32) string {
+	h, _, _ := procOpenProcess.Call(uintptr(processQueryLimitedInformation), 0, uintptr(pid))
+	if h == 0 {
+		return ""
+	}
+	defer procCloseHandle.Call(h)
+	buf := make([]uint16, 260)
+	size := uint32(len(buf))
+	r, _, _ := procQueryFullProcessImageNameW.Call(
+		h, 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)))
+	if r == 0 {
+		return ""
+	}
+	return filepath.Base(syscall.UTF16ToString(buf[:size]))
 }
 
 func availableOS() (bool, string) {

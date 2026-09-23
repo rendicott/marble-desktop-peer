@@ -34,6 +34,11 @@ func keyOS(ctx context.Context, key string) error {
 	return fmt.Errorf("desktop key not implemented on %s", runtime.GOOS)
 }
 
+func activeWindowOS(ctx context.Context) (title, app string, err error) {
+	_ = ctx
+	return "", "", fmt.Errorf("active window lookup not implemented on %s", runtime.GOOS)
+}
+
 func availableOS() (bool, string) {
 	return false, "desktop not implemented on " + runtime.GOOS
 }

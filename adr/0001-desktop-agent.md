@@ -177,7 +177,7 @@ $MARBLE_PEER_HOME/                    # default ~/.marble-peer  (override env)
 Normative messages are defined in marble `docs/peer-protocol` (ADR-0020 M2). Peer responsibilities:
 
 1. **Dial-out** WebSocket to harness with device token after pair.  
-2. **Heartbeat** every 30s with caps: `{browser, desktop, confirm, protocol_version, os, peer_version}`.  
+2. **Heartbeat** every 30s with caps: `{browser, desktop, confirm, exec, protocol_version, os, peer_version}`.  
 3. **Receive action frames** → enqueue (reject if queue full / busy with structured error).  
 4. **Return results**: ok, error, screenshot bytes (chunked or upload URL if protocol specifies), snapshot text.  
 5. **Honor cancel** frames immediately (`context.Cancel`).  
@@ -187,8 +187,9 @@ Normative messages are defined in marble `docs/peer-protocol` (ADR-0020 M2). Pee
 
 | Kind | Backend | Notes |
 |------|---------|-------|
-| `screenshot` | **desktop primary full screen** (**Q_P3**) | JPEG preferred; max edge 1280 |
-| `desktop.click/type/key/move` | robotgo | Primary display coords |
+| `screenshot` | **desktop primary full screen** (**Q_P3**) | JPEG preferred; max edge 1280; `meta.window_title`/`meta.focused_app` best-effort |
+| `desktop.click/type/key/move` | robotgo | Primary display coords; `desktop_click`/`desktop_type` return an atomic post-action screenshot |
+| `computer_exec` | `internal/shellexec` (`os/exec`; powershell.exe on Windows, bash/sh elsewhere) | Returns `stdout`/`stderr`/`exit_code`/`shell` as text — added so peer state (files, logs, config) is legible without reading a terminal window's pixels; see marble field report `peer-gui-loop-report` (2026-09-23) |
 | `browser.tabs/open/snapshot/act` | Playwright helper | Snapshot before act when possible |
 | `confirm` | miniui + tray | 120s deny (ADR-0020) |
 | `stop` / cancel | queue | Clears current + pending |

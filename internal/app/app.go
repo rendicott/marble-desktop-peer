@@ -26,6 +26,7 @@ import (
 	"github.com/rendicott/marble-desktop-peer/internal/keepalive"
 	"github.com/rendicott/marble-desktop-peer/internal/protocol"
 	"github.com/rendicott/marble-desktop-peer/internal/queue"
+	"github.com/rendicott/marble-desktop-peer/internal/shellexec"
 )
 
 // App is the long-running peer daemon.
@@ -86,6 +87,7 @@ func (a *App) caps() protocol.Caps {
 		Browser: a.Browser.Available(),
 		Desktop: desk,
 		Confirm: true,
+		Exec:    true, // os/exec shells out on every platform — no extra probe needed
 	}
 }
 
@@ -308,9 +310,11 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 			return protocol.Envelope{OK: false, Error: err.Error()}
 		}
 		ls := desktop.QueryLockState(ctx)
-		m := desktop.MetaMap(meta, map[string]interface{}{
+		extra := map[string]interface{}{
 			"locked": ls.Locked, "lock_source": ls.Source,
-		})
+		}
+		addActiveWindow(ctx, extra)
+		m := desktop.MetaMap(meta, extra)
 		text := ""
 		if ls.Locked {
 			text = desktop.FormatLockWarning(ls)
@@ -336,10 +340,12 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		if shotErr == nil {
 			ls := desktop.QueryLockState(ctx)
 			envOut.ScreenshotB64 = base64.StdEncoding.EncodeToString(img)
-			envOut.Meta = desktop.MetaMap(meta, map[string]interface{}{
+			extra := map[string]interface{}{
 				"locked": ls.Locked, "lock_source": ls.Source,
 				"last_click": map[string]int{"x": x, "y": y},
-			})
+			}
+			addActiveWindow(ctx, extra)
+			envOut.Meta = desktop.MetaMap(meta, extra)
 			if ls.Locked {
 				envOut.Text = text + "\n" + desktop.FormatLockWarning(ls)
 			}
@@ -355,7 +361,25 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		if err := desktop.Type(ctx, text); err != nil {
 			return protocol.Envelope{OK: false, Error: err.Error()}
 		}
-		return protocol.Envelope{OK: true}
+		// Atomic post-type screenshot, same reasoning as desktop_click: without
+		// it the harness has no "did my keystrokes land?" signal and (per field
+		// report peer-gui-loop-report, 2026-09-23) can retype the same text into
+		// an unfocused window indefinitely with no visible failure.
+		img, meta, shotErr := desktop.Screenshot(ctx)
+		envOut := protocol.Envelope{OK: true}
+		if shotErr == nil {
+			ls := desktop.QueryLockState(ctx)
+			envOut.ScreenshotB64 = base64.StdEncoding.EncodeToString(img)
+			extra := map[string]interface{}{"locked": ls.Locked, "lock_source": ls.Source}
+			addActiveWindow(ctx, extra)
+			envOut.Meta = desktop.MetaMap(meta, extra)
+			if ls.Locked {
+				envOut.Text = desktop.FormatLockWarning(ls)
+			}
+		} else {
+			envOut.Meta = map[string]interface{}{"post_type_screenshot_error": shotErr.Error()}
+		}
+		return envOut
 	case "desktop_key":
 		key, _ := payload["key"].(string)
 		if err := desktop.Key(ctx, key); err != nil {
@@ -423,8 +447,43 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		harnessURL, _ := payload["harness_url"].(string)
 		ok, detail := a.waitConfirm(ctx, env.ID, prompt, risk, harnessURL)
 		return protocol.Envelope{Type: "confirm_result", ID: env.ID, OK: ok, Text: detail}
+	case "computer_exec":
+		// Run a command on the peer and return stdout/stderr/exit_code as text —
+		// this is the fix for the pixel-reading loop in field report
+		// peer-gui-loop-report (2026-09-23): reading peer state (config, logs,
+		// installed software) no longer requires opening a terminal window and
+		// reading a screenshot of it.
+		command, _ := payload["command"].(string)
+		cwd, _ := payload["cwd"].(string)
+		timeoutSec, _ := asInt(payload["timeout_sec"])
+		res, err := shellexec.Run(ctx, command, cwd, timeoutSec)
+		meta := map[string]interface{}{
+			"stdout": res.Stdout, "stderr": res.Stderr, "exit_code": res.ExitCode,
+			"shell": res.Shell, "truncated": res.Truncated, "timed_out": res.TimedOut,
+		}
+		if err != nil {
+			return protocol.Envelope{OK: false, Error: err.Error(), Meta: meta}
+		}
+		return protocol.Envelope{OK: true, Text: res.Stdout, Meta: meta}
 	default:
 		return protocol.Envelope{OK: false, Error: "unknown kind " + env.Kind}
+	}
+}
+
+// addActiveWindow best-effort adds focused_app/window_title to a Meta map so
+// the harness can tell "did my keystrokes land where I think?" without a
+// second call (field report peer-gui-loop-report, 2026-09-23, P2). Silent on
+// error/unsupported platform — this is advisory, never blocking.
+func addActiveWindow(ctx context.Context, extra map[string]interface{}) {
+	title, app, err := desktop.ActiveWindow(ctx)
+	if err != nil {
+		return
+	}
+	if title != "" {
+		extra["window_title"] = title
+	}
+	if app != "" {
+		extra["focused_app"] = app
 	}
 }
 
@@ -749,7 +808,7 @@ func (a *App) StatusJSON() map[string]interface{} {
 		"device_id":        a.Cfg.DeviceID,
 		"harness_url":      a.Cfg.HarnessURL,
 		"peer_version":     PeerVersion,
-		"caps":             protocol.Caps{Browser: browserOK, Desktop: desk, Confirm: true},
+		"caps":             protocol.Caps{Browser: browserOK, Desktop: desk, Confirm: true, Exec: true},
 		"desktop_note":     deskNote,
 		"desktop_ok":       desk,
 		"browser_ok":       browserOK,
@@ -892,6 +951,7 @@ func Pair(harnessURL, hCode string, allowHTTP bool) error {
 			"browser": findChrome() != "",
 			"desktop": desk,
 			"confirm": true,
+			"exec":    true,
 		},
 	}
 	b, _ := json.Marshal(body)

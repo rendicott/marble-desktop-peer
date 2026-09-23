@@ -242,14 +242,37 @@ $.CGEventPost(0, up);
 }
 
 func logFrontmost(ctx context.Context) {
-	cmd := exec.CommandContext(ctx, "osascript", "-e",
-		`tell application "System Events" to get name of first application process whose frontmost is true`)
-	out, err := cmd.CombinedOutput()
-	name := strings.TrimSpace(string(out))
-	if err != nil || name == "" {
+	_, app, err := activeWindowOS(ctx)
+	if err != nil || app == "" {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "marble-peer desktop: frontmost after click: %s\n", name)
+	fmt.Fprintf(os.Stderr, "marble-peer desktop: frontmost after click: %s\n", app)
+}
+
+// activeWindowOS returns the frontmost app's name and, best-effort, the title
+// of its front window (many apps/dialogs expose no window name — that half
+// is left empty rather than erroring the whole call).
+func activeWindowOS(ctx context.Context) (title, app string, err error) {
+	script := `tell application "System Events"
+	set frontApp to first application process whose frontmost is true
+	set appName to name of frontApp
+	set winTitle to ""
+	try
+		set winTitle to name of front window of frontApp
+	end try
+	return appName & "|" & winTitle
+end tell`
+	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", "", fmt.Errorf("osascript frontmost: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(out)), "|", 2)
+	app = parts[0]
+	if len(parts) > 1 {
+		title = parts[1]
+	}
+	return title, app, nil
 }
 
 func typeOS(ctx context.Context, text string) error {

@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+Fixes for the failure mode in field report `peer-gui-loop-report` (2026-09-23): an agent driving a
+Windows peer entirely through screenshot→click→type pixel loops, with no way to read a command's
+output as text.
+
+- **`computer_exec`**: new peer action kind that runs a command (powershell.exe on Windows, bash/sh
+  elsewhere) and returns `stdout`/`stderr`/`exit_code` as text, instead of requiring a terminal window
+  to be opened, typed into, screenshotted, and visually read. Advertised via `caps.exec`.
+- `screenshot` and `desktop_click` now include best-effort `window_title`/`focused_app` in `meta`, so
+  the harness can tell what's focused without a second call.
+- `desktop_type` now returns an atomic post-type screenshot (same pattern `desktop_click` already
+  had), so a stuck/unfocused field is visible immediately instead of retyping into it silently.
+
 ## [v0.1.2] — 2026-09-22
 
 First release with **Windows** assets. The Windows peer needs an **interactive desktop session** — see the callout below and the README Windows section.

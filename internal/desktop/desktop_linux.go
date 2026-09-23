@@ -103,21 +103,35 @@ func clickOS(ctx context.Context, sx, sy int, button string) error {
 }
 
 func logActiveWindow(ctx context.Context, xd string) {
-	if xd == "" {
-		var err error
-		xd, err = findXdotool()
-		if err != nil {
-			return
-		}
+	title, _, err := activeWindowOS(ctx)
+	if err != nil || title == "" {
+		return
+	}
+	_ = xd // kept for call-site compat; activeWindowOS finds xdotool itself
+	fmt.Fprintf(os.Stderr, "marble-peer desktop: active window after click: %s\n", title)
+}
+
+// activeWindowOS returns the active window's title and its X11 window class
+// (closest analog to an "app name" on Linux/X11/XWayland).
+func activeWindowOS(ctx context.Context) (title, app string, err error) {
+	xd, err := findXdotool()
+	if err != nil {
+		return "", "", err
 	}
 	cmd := exec.CommandContext(ctx, xd, "getactivewindow", "getwindowname")
 	ensureDisplay(cmd)
 	out, err := cmd.CombinedOutput()
-	name := strings.TrimSpace(string(out))
-	if err != nil || name == "" {
-		return
+	if err != nil {
+		return "", "", fmt.Errorf("xdotool getwindowname: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	fmt.Fprintf(os.Stderr, "marble-peer desktop: active window after click: %s\n", name)
+	title = strings.TrimSpace(string(out))
+
+	cmd2 := exec.CommandContext(ctx, xd, "getactivewindow", "getwindowclassname")
+	ensureDisplay(cmd2)
+	if out2, err2 := cmd2.CombinedOutput(); err2 == nil {
+		app = strings.TrimSpace(string(out2))
+	}
+	return title, app, nil
 }
 
 func xdotoolMoveClick(ctx context.Context, xd string, x, y int, button string, clear bool) error {
