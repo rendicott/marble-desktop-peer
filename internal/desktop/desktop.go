@@ -315,6 +315,18 @@ func Key(ctx context.Context, key string) error {
 	return keyOS(ctx, key)
 }
 
+// ActiveWindow returns the foreground window's title and owning app/process
+// name, best-effort (either may be empty if the platform can't determine it).
+// Lets a caller answer "did my keystrokes land where I think?" from the same
+// screenshot/action call instead of a second round trip — see field report
+// peer-gui-loop-report (2026-09-23).
+func ActiveWindow(ctx context.Context) (title, app string, err error) {
+	if !enabled() {
+		return "", "", fmt.Errorf("desktop disabled (MARBLE_PEER_DESKTOP=0)")
+	}
+	return activeWindowOS(ctx)
+}
+
 // Available reports whether desktop ops can work (tools present; permissions may still be needed).
 func Available() (bool, string) {
 	if !enabled() {
