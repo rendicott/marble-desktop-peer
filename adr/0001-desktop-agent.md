@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | Accepted (ready to implement) |
+| **Status** | Accepted / Implemented (latest v0.1.3) |
 | **Date** | 2026-07-27 |
 | **Author** | — |
 | **Deciders** | Project owner |
