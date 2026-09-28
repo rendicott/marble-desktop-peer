@@ -111,6 +111,29 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Import Developer ID
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "no APPLE_CERTIFICATE; unsigned build"
+            exit 0
+          fi
+          CERT="$RUNNER_TEMP/cert.p12"
+          if ! printf '%s' "$APPLE_CERTIFICATE" | base64 -d > "$CERT" 2>/dev/null; then
+            printf '%s' "$APPLE_CERTIFICATE" > "$CERT"
+          fi
+          KW="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "ci" "$KW"
+          security set-keychain-settings -lut 21600 "$KW"
+          security unlock-keychain -p "ci" "$KW"
+          security import "$CERT" -k "$KW" -P "${APPLE_CERTIFICATE_PASSWORD:-}" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "ci" "$KW"
+          security list-keychain -d user -s "$KW" login.keychain
+
       - name: Build
         env:
           VERSION: ${{ needs.version.outputs.tag }}
@@ -133,6 +156,102 @@ jobs:
             chmod +x "$out"
           done
           ls -la dist
+
+      - name: Sign macOS binaries
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "no APPLE_CERTIFICATE; skipping codesign"
+            exit 0
+          fi
+          ID="${APPLE_SIGNING_IDENTITY:-Developer ID Application: Russell Endicott (F9ZLV9F2P3)}"
+          for f in dist/marble-peer-darwin-*; do
+            echo "Signing $f…"
+            codesign --force --options runtime --timestamp --sign "$ID" "$f"
+            codesign --verify --strict --verbose=2 "$f"
+            codesign -dv "$f" 2>&1 | grep -E "Authority|TeamIdentifier" || true
+          done
+
+      - name: Package macOS app bundles
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Ship a .zip containing MarblePeer.app rather than a bare binary.
+          #
+          # Two reasons: (1) notarization only accepts bundles/disk images, not
+          # loose executables; (2) the .app bundle is what gives the peer a GUI
+          # identity, which is what makes screencapture work on macOS. Shipping
+          # the bundle means `install-autostart` has nothing to build.
+          for ARCH in arm64 amd64; do
+            BIN="dist/marble-peer-darwin-${ARCH}"
+            APP="dist/MarblePeer.app"
+            rm -rf "$APP"
+            mkdir -p "$APP/Contents/MacOS"
+            cp "$BIN" "$APP/Contents/MacOS/MarblePeer"
+            chmod +x "$APP/Contents/MacOS/MarblePeer"
+            # Written with printf (not a heredoc) so the YAML block scalar's
+            # indentation cannot leak into the plist.
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0">' \
+              '<dict>' \
+              '  <key>CFBundleExecutable</key><string>MarblePeer</string>' \
+              '  <key>CFBundleIdentifier</key><string>com.rendicott.marble-peer</string>' \
+              '  <key>CFBundleName</key><string>MarblePeer</string>' \
+              '  <key>CFBundleDisplayName</key><string>Marble Peer</string>' \
+              '  <key>CFBundlePackageType</key><string>APPL</string>' \
+              '  <key>CFBundleShortVersionString</key><string>1.0</string>' \
+              '  <key>CFBundleVersion</key><string>1</string>' \
+              '  <key>LSMinimumSystemVersion</key><string>11.0</string>' \
+              '  <key>LSUIElement</key><true/>' \
+              '  <key>NSHighResolutionCapable</key><true/>' \
+              '</dict>' \
+              '</plist>' \
+              > "$APP/Contents/Info.plist"
+            plutil -lint "$APP/Contents/Info.plist"
+            if [ -n "${APPLE_CERTIFICATE:-}" ]; then
+              ID="${APPLE_SIGNING_IDENTITY:-Developer ID Application: Russell Endicott (F9ZLV9F2P3)}"
+              codesign --force --deep --options runtime --timestamp \
+                --identifier com.rendicott.marble-peer --sign "$ID" "$APP"
+              codesign --verify --deep --strict --verbose=2 "$APP"
+            fi
+            ( cd dist && ditto -c -k --keepParent MarblePeer.app "marble-peer-darwin-${ARCH}.app.zip" )
+          done
+          ls -la dist
+
+      - name: Notarize
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_API_KEY_P8:-}" ]; then
+            echo "no APPLE_API_KEY_P8; skipping notarization (signed but not notarized)"
+            exit 0
+          fi
+          mkdir -p "${HOME}/.appstoreconnect/private_keys"
+          KEY_PATH="${HOME}/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s\n' "${APPLE_API_KEY_P8}" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          for z in dist/marble-peer-darwin-*.app.zip; do
+            echo "Notarizing $z…"
+            SUBMIT=$(xcrun notarytool submit "$z" \
+              --key "$KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+              --wait --output-format json || true)
+            echo "$SUBMIT"
+            SID=$(printf '%s' "$SUBMIT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" || true)
+            if [ -n "$SID" ]; then
+              xcrun notarytool log "$SID" --key "$KEY_PATH" \
+                --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
+            fi
+          done
 
       - name: Upload Darwin artifacts
         uses: actions/upload-artifact@v4
@@ -221,11 +340,16 @@ jobs:
             dist/marble-peer-linux-arm64
             dist/marble-peer-darwin-arm64
             dist/marble-peer-darwin-amd64
+            dist/marble-peer-darwin-arm64.app.zip
+            dist/marble-peer-darwin-amd64.app.zip
             dist/marble-peer-windows-amd64.exe
             dist/marble-peer-windows-arm64.exe
             dist/SHA256SUMS
           body: |
-            Pre-built **marble-peer** binaries built on **GitHub Actions** (`CGO_ENABLED=0`). Unsigned portable files — **no `.dmg`, notarization or Authenticode signing**.
+            Pre-built **marble-peer** binaries built on **GitHub Actions** (`CGO_ENABLED=0`).
+
+            macOS artifacts are **Developer ID signed** (and notarized when the App Store Connect
+            API key secrets are configured). Linux and Windows artifacts are unsigned.
 
             Linux targets compile on `ubuntu-latest`. macOS targets compile on `macos-latest` (not Linux cross-compile). Windows targets compile on `windows-latest`.
 
@@ -235,19 +359,36 @@ jobs:
             |-------|----------|
             | `marble-peer-linux-amd64` | Linux x86_64 |
             | `marble-peer-linux-arm64` | Linux aarch64 |
-            | `marble-peer-darwin-arm64` | macOS Apple Silicon |
-            | `marble-peer-darwin-amd64` | macOS Intel |
+            | `marble-peer-darwin-arm64` | macOS Apple Silicon (bare binary) |
+            | `marble-peer-darwin-amd64` | macOS Intel (bare binary) |
+            | `marble-peer-darwin-arm64.app.zip` | macOS Apple Silicon (**signed app bundle — recommended**) |
+            | `marble-peer-darwin-amd64.app.zip` | macOS Intel (**signed app bundle — recommended**) |
             | `marble-peer-windows-amd64.exe` | Windows 10/11 x64 |
             | `marble-peer-windows-arm64.exe` | Windows 11 on ARM |
+
+            **macOS (recommended — signed app bundle):**
+
+            ```bash
+            curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/marble-peer-darwin-arm64.app.zip
+            unzip -o marble-peer-darwin-arm64.app.zip -d ~/Applications
+            ~/Applications/MarblePeer.app/Contents/MacOS/MarblePeer install-autostart
+            ```
+
+            The `.app` bundle is what gives the peer a **GUI identity**, which macOS requires for
+            `screencapture`. A bare binary started by `launchd` fails with
+            `could not create image from display` even with every permission granted. Because the
+            bundle is Developer ID signed, your Screen Recording / Accessibility grants **survive
+            upgrades** — no re-granting.
+
+            **macOS (bare binary):**
 
             ```bash
             curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/marble-peer-darwin-arm64
             curl -fsSL -O https://github.com/rendicott/marble-desktop-peer/releases/latest/download/SHA256SUMS
             grep marble-peer-darwin-arm64 SHA256SUMS | shasum -a 256 -c -
             chmod +x marble-peer-darwin-arm64
-            xattr -d com.apple.quarantine marble-peer-darwin-arm64 2>/dev/null || true
-            ./marble-peer-darwin-arm64 version
-            ./marble-peer-darwin-arm64 doctor
+            mv marble-peer-darwin-arm64 ~/.local/bin/marble-peer
+            marble-peer install-autostart   # builds the .app bundle locally
             ```
 
             ```powershell
@@ -260,7 +401,7 @@ jobs:
             ```
 
             **Linux desktop tools (recommended):** `xdotool`, `gnome-screenshot` (or ImageMagick `import`).
-            **macOS install:** `chmod +x` → `xattr -d com.apple.quarantine` (unsigned download) → move to `~/.local/bin/marble-peer` → `marble-peer doctor --open-settings` → grant **Screen Recording** and **Accessibility**. See the [README](https://github.com/rendicott/marble-desktop-peer#readme).
+            **macOS install:** see the app-bundle block above → `marble-peer doctor --open-settings` → grant **Screen Recording** and **Accessibility** to **Marble Peer**. See the [README](https://github.com/rendicott/marble-desktop-peer#readme).
             **Windows install:** no extra packages; see the [README](https://github.com/rendicott/marble-desktop-peer#windows) (unsigned binary: SmartScreen may ask you to confirm; input into elevated windows needs an elevated peer).
             **Chrome** required for browser automation (CDP mirror profile under `~/.marble-peer`).
 

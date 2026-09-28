@@ -67,24 +67,58 @@ marble-peer version
 marble-peer doctor --open-settings
 ```
 
-**3. Grant permissions** to the app that *launches* marble-peer:
+**3. Install the app bundle and grant permissions.**
+
+macOS will not let a bare binary capture the screen. `screencapture` only works
+when the calling process has a **GUI identity**, which means it must run from
+inside a `.app` bundle. A peer started directly by `launchd`, or from an SSH
+shell, fails with `could not create image from display` **even with every
+permission granted**.
+
+`install-autostart` creates `~/Applications/MarblePeer.app` and a LaunchAgent
+that runs it, so this is handled for you:
+
+```bash
+marble-peer install-autostart
+```
+
+Then grant permissions to **Marble Peer** (not Terminal):
 
 | Setting | Why |
 |---------|-----|
 | **System Settings → Privacy & Security → Screen Recording** | Full-desktop screenshots |
 | **System Settings → Privacy & Security → Accessibility** | Synthesized click / type / key |
 
-- Run from **Terminal / iTerm**: enable that terminal app.  
-- Started as a **Login Item** (`install-autostart`): enable **marble-peer**.  
-- You may also see **osascript** / **marble-desk** — enable those if listed.  
+`marble-peer doctor` prints a `gui:` line telling you whether the peer has a
+GUI identity, and a `signing:` line telling you whether permissions will
+survive upgrades.
 
-Unsigned rebuilds can drop off the list; re-grant if `doctor` reports screen/accessibility denied. Mini UI (`http://127.0.0.1:18765`) also has a permission banner.
+**Keeping permissions across upgrades.** macOS pins a permission grant to the
+app's code-signing identity. With ad-hoc signing that identity is the binary
+hash, so **every upgrade invalidates your grants** and you must re-grant. To
+avoid that, create a stable self-signed identity once:
+
+```bash
+marble-peer install-autostart --trust-cert
+```
+
+Run that from a **Terminal window on the Mac** (not over SSH) — macOS requires
+an interactive authorization to trust the certificate. If you have a
+**Developer ID Application** certificate, it is detected and used automatically
+and you can skip this step.
 
 **4. Pair with Marble, then run** (see [Pair](#pair-mutual-handshake)):
 
 ```bash
 marble-peer pair --harness https://YOUR-HARNESS --code HXXXXX
 marble-peer run
+```
+
+If you started the peer from an SSH shell and need GUI access immediately
+without installing autostart, relaunch it through its bundle:
+
+```bash
+marble-peer run --gui
 ```
 
 **5. Optional — start at login** (LaunchAgent `~/Library/LaunchAgents/com.rendicott.marble-peer.plist`):
@@ -388,7 +422,9 @@ marble-peer run --no-tray         # foreground without tray
 
 ### macOS
 
-Starts at login via a **LaunchAgent** (`~/Library/LaunchAgents/com.rendicott.marble-peer.plist`). Keep-awake uses `caffeinate`. Tray is a Swift menu bar extra (compiled on first `run`).
+Starts at login via a **LaunchAgent** (`~/Library/LaunchAgents/com.rendicott.marble-peer.plist`) that
+runs `~/Applications/MarblePeer.app`. Keep-awake uses `caffeinate`. Tray is a Swift menu bar extra
+(compiled on first `run`).
 
 ```bash
 # Binary must already live at a stable path (see macOS install above).
@@ -398,11 +434,26 @@ launchctl print gui/$(id -u)/com.rendicott.marble-peer
 tail -f ~/Library/Logs/marble-peer.log
 ```
 
-After the first LaunchAgent start, grant **Screen Recording** and **Accessibility** to `marble-peer` (System Settings). `KeepAlive` is false so tray **Quit** is a clean exit.
+After the first LaunchAgent start, grant **Screen Recording** and **Accessibility** to
+**Marble Peer** (System Settings). `KeepAlive` is false so tray **Quit** is a clean exit.
+
+**Why an app bundle?** `screencapture` is attributed to the *responsible* process, and only a process
+running from inside a `.app` bundle gets a usable GUI identity. A peer started directly by `launchd`
+fails with `could not create image from display` even with every permission granted. The bundle is
+what makes screenshots work under `install-autostart`.
+
+**Why `--trust-cert`?** macOS pins a permission grant to the app's code-signing identity. Ad-hoc
+signing means the identity is the binary hash, so every upgrade invalidates your grants. A stable
+self-signed identity (or a Developer ID) keeps them across upgrades:
 
 ```bash
-marble-peer uninstall-autostart
-marble-peer run --no-tray
+marble-peer install-autostart --trust-cert   # run from a Terminal window on the Mac
+```
+
+```bash
+marble-peer uninstall-autostart   # removes the LaunchAgent and the app bundle
+marble-peer run --no-tray         # foreground without tray
+marble-peer run --gui             # relaunch through the bundle (SSH escape hatch)
 ```
 
 ## CLI overview
@@ -411,10 +462,13 @@ marble-peer run --no-tray
 |---------|---------|
 | `marble-peer pair` | Complete mutual pairing with a harness H-code |
 | `marble-peer run` | Long-running daemon (WS + actions + optional tray) |
+| `marble-peer run --gui` | macOS: relaunch through the app bundle to gain a GUI identity |
 | `marble-peer status` | Local JSON status + desktop availability |
 | `marble-peer unpair` | Clear local computer id + device token |
-| `marble-peer install-autostart` / `uninstall-autostart` | Login start (Linux systemd --user / macOS LaunchAgent / Windows Startup folder) |
-| `marble-peer doctor` | Local probe: Chrome, desktop tools, lock state, macOS TCC, screenshot |
+| `marble-peer install-autostart` | Login start (Linux systemd --user / macOS app bundle + LaunchAgent / Windows Startup folder) |
+| `marble-peer install-autostart --trust-cert` | macOS: create a stable self-signed signing identity so permissions survive upgrades |
+| `marble-peer uninstall-autostart` | Remove login start (and the macOS app bundle) |
+| `marble-peer doctor` | Local probe: Chrome, desktop tools, lock state, macOS TCC, GUI identity, signing, screenshot |
 | `marble-peer version` | Print version (release builds inject tag/commit/date) |
 
 ## Design & protocol

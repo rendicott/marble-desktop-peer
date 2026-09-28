@@ -528,13 +528,22 @@ func openPrivacySettingsOS(section string) error {
 
 func permsHelpOS() string {
 	return strings.TrimSpace(`
-macOS permissions required for marble-peer desktop control:
-  1. System Settings → Privacy & Security → Screen Recording
-     Enable the app that launched marble-peer (Terminal / iTerm from a shell, or marble-peer if started as a Login Item).
-  2. System Settings → Privacy & Security → Accessibility
-     Enable the same app so clicks and keystrokes can be synthesized.
-     If you also see marble-desk / osascript listed, enable those too.
+macOS desktop control needs two things:
 
-Then re-run: marble-peer doctor
-Or open the panes: marble-peer doctor --open-settings`)
+1. PERMISSIONS — System Settings → Privacy & Security
+   • Screen Recording  → enable "Marble Peer" (or Terminal, if you run the
+     peer from a terminal window)
+   • Accessibility     → enable the same app
+   Open the panes with: marble-peer doctor --open-settings
+
+2. A GUI IDENTITY — screencapture only works when the peer was started
+   through Launch Services. A peer started by launchd directly, or from an
+   SSH shell, fails with "could not create image from display" even with
+   every permission granted.
+
+   Fix (pick one):
+   • marble-peer install-autostart   # installs a .app bundle + LaunchAgent
+   • marble-peer run --gui           # relaunch through Launch Services now
+
+   Check with: marble-peer doctor    # look at the "gui:" line`)
 }

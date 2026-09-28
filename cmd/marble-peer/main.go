@@ -76,12 +76,26 @@ func main() {
 		noTray := fs.Bool("no-tray", false, "Disable system tray icon")
 		browserMode := fs.String("browser-mode", "", "user (default, your Chrome profile) | marble (isolated)")
 		cdpPort := fs.Int("cdp-port", 0, "Attach to this CDP port (default try 9222)")
+		gui := fs.Bool("gui", false, "macOS: relaunch through Launch Services so screencapture works")
 		_ = fs.Parse(args)
+		if *gui {
+			if err := autostart.RelaunchViaLaunchServices(args); err != nil {
+				log.Fatalf("--gui: %v", err)
+			}
+			return
+		}
 		runDaemon(*killBrowser, !*noMini, !*noTray, *browserMode, *cdpPort)
 	case "install-autostart":
 		fs := flag.NewFlagSet("install-autostart", flag.ExitOnError)
 		noEnable := fs.Bool("no-enable", false, "Only write unit files; do not enable/start")
+		trustCert := fs.Bool("trust-cert", false, "macOS: create a stable self-signed signing identity (run from a Terminal window on the Mac)")
 		_ = fs.Parse(args)
+		if *trustCert {
+			if err := autostart.CreateSelfSignedCert(); err != nil {
+				log.Fatalf("--trust-cert: %v", err)
+			}
+			fmt.Println("stable signing identity ready — permissions will now survive upgrades")
+		}
 		exe, err := os.Executable()
 		if err != nil {
 			log.Fatal(err)
@@ -464,6 +478,37 @@ func runDoctor(openSettings, requestPerms, doShot bool) int {
 
 	ls := desktop.QueryLockState(context.Background())
 	fmt.Printf("lock:      locked=%v source=%s %s\n", ls.Locked, ls.Source, ls.Detail)
+
+	if runtime.GOOS == "darwin" {
+		// Explain the app-bundle requirement up front: screencapture only
+		// works when the peer runs from inside its .app bundle. A peer started
+		// directly by launchd, or from an SSH shell, fails with
+		// "could not create image from display" even with every TCC grant.
+		//
+		// Only report this when doctor runs from the peer's own binary path.
+		// When doctor runs from an SSH shell or a different copy, the check
+		// would describe the shell rather than the running peer, which is
+		// misleading.
+		if autostart.RunningViaLaunchServices() {
+			fmt.Println("gui:       running from MarblePeer.app (GUI identity present)")
+		} else if autostart.IsPeerBinary() {
+			fmt.Println("gui:       NOT running from MarblePeer.app — screencapture will fail")
+			fmt.Println("           fix: marble-peer install-autostart")
+			fmt.Println("           or:  marble-peer run --gui")
+		} else {
+			fmt.Println("gui:       (n/a — doctor is not running from the peer binary)")
+		}
+		if stale, p := autostart.BundleStale(); stale {
+			fmt.Println("bundle:    STALE — the app bundle holds an older binary")
+			fmt.Printf("           re-run: marble-peer install-autostart  (%s)\n", p)
+		}
+		if usable, hint := autostart.SigningStatus(); !usable {
+			fmt.Println("signing:   no stable identity — permissions reset on every upgrade")
+			fmt.Println("           " + hint)
+		} else {
+			fmt.Println("signing:   stable identity present (permissions survive upgrades)")
+		}
+	}
 
 	failed := false
 	if runtime.GOOS == "darwin" {

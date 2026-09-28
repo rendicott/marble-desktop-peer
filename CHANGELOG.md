@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### macOS: fix screen capture and make permissions survive upgrades
+
+macOS would not let the peer capture the screen at all in the common
+`install-autostart` setup. `screencapture` fails with
+`could not create image from display` **even with Screen Recording and
+Accessibility granted**, because the peer had no GUI identity.
+
+Root cause (verified on macOS 27): `screencapture` is attributed to the
+*responsible* process, and only a process running from inside a `.app` bundle
+gets a usable GUI identity. A peer started directly by `launchd`, or from an
+SSH shell, does not — regardless of TCC grants or `LimitLoadToSessionType=Aqua`.
+
+- **`install-autostart` now creates `~/Applications/MarblePeer.app`** with the
+  peer binary as the bundle's `CFBundleExecutable`, and points the LaunchAgent
+  at it. This is the configuration that actually works; a shell-script launcher
+  that spawns the binary as a child does **not**.
+- **`marble-peer run --gui`** relaunches through the bundle, for users who
+  started the peer from an SSH shell and want GUI access without installing
+  autostart.
+- **`install-autostart --trust-cert`** creates a persistent self-signed
+  codesigning identity. macOS pins a permission grant to the app's signing
+  identity, so with ad-hoc signing **every upgrade invalidated the user's
+  grants**. A stable identity fixes that permanently. A Developer ID
+  Application certificate is detected and preferred automatically.
+- **`doctor` now reports `gui:` and `signing:` lines** so both failure modes are
+  self-explanatory instead of surfacing as a bare `screencapture` error.
+- `doctor` no longer reports misleading `gui:`/`bundle:` warnings when run from
+  an SSH shell (it now checks whether it is running from the peer binary).
+- Rewrote the macOS permission help text to explain both requirements
+  (permissions *and* bundle identity) with the exact fix commands.
+- Split autostart build tags per platform (`darwin.go`, `other.go`,
+  `windows_stub.go`, `darwin_stub.go`, `launchservices_other.go`) so all three
+  targets compile cleanly.
+
+## [v0.1.3] — 2026-09-23
+
 Fixes for the failure mode in field report `peer-gui-loop-report` (2026-09-23): an agent driving a
 Windows peer entirely through screenshot→click→type pixel loops, with no way to read a command's
 output as text.
