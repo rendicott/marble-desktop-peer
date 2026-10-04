@@ -107,6 +107,23 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.version.outputs.tag }}
 
+      # The signing action has to come from the ref this workflow file lives on,
+      # not from the tag being built: a tag cannot contain CI that did not exist
+      # when it was cut, so without this a re-release of an older tag silently
+      # builds unsigned (that is how the first v0.2.0 release came out). On a tag
+      # push github.sha *is* the tag, so this is a no-op there.
+      - name: Use the signing action from this workflow's ref
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if git cat-file -e "${WORKFLOW_SHA}:.github/actions/apple-sign-import/action.yml" 2>/dev/null; then
+            git checkout "$WORKFLOW_SHA" -- .github/actions
+            ls -l .github/actions/apple-sign-import
+          else
+            echo "::warning title=No signing action at ${WORKFLOW_SHA}::.github/actions/apple-sign-import is not in that commit, so the certificate cannot be imported and the macOS artifacts will be unsigned."
+          fi
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
