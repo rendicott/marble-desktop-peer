@@ -4,7 +4,7 @@ import AppKit
 import Darwin
 import Foundation
 
-let helperVersion = "1"
+let helperVersion = "2"
 
 if CommandLine.arguments.dropFirst().first == "version" {
     print(helperVersion)
@@ -15,6 +15,8 @@ class TrayApp: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     var statusItem: NSMenuItem!
     var idItem: NSMenuItem!
+    var lockItem: NSMenuItem!
+    var clearLockItem: NSMenuItem!
     var confirmItem: NSMenuItem!
     var timer: Timer?
     let parent = Int32(ProcessInfo.processInfo.environment["MARBLE_PEER_PID"] ?? "0") ?? 0
@@ -29,12 +31,16 @@ class TrayApp: NSObject, NSApplicationDelegate {
             btn.toolTip = "Marble Peer"
         }
         let menu = NSMenu()
+        menu.autoenablesItems = false
         statusItem = NSMenuItem(title: "Status: starting…", action: nil, keyEquivalent: "")
         statusItem.isEnabled = false
         menu.addItem(statusItem)
         idItem = NSMenuItem(title: "Computer: —", action: nil, keyEquivalent: "")
         idItem.isEnabled = false
         menu.addItem(idItem)
+        lockItem = NSMenuItem(title: "Lock: —", action: nil, keyEquivalent: "")
+        lockItem.isEnabled = false
+        menu.addItem(lockItem)
         menu.addItem(NSMenuItem.separator())
         confirmItem = NSMenuItem(title: "No pending confirmations", action: #selector(openConfirm), keyEquivalent: "")
         confirmItem.target = self
@@ -46,6 +52,10 @@ class TrayApp: NSObject, NSApplicationDelegate {
         let stopItem = NSMenuItem(title: "Stop current action", action: #selector(stopAction), keyEquivalent: "")
         stopItem.target = self
         menu.addItem(stopItem)
+        clearLockItem = NSMenuItem(title: "Clear lock", action: #selector(clearLock), keyEquivalent: "")
+        clearLockItem.target = self
+        clearLockItem.isEnabled = false
+        menu.addItem(clearLockItem)
         menu.addItem(NSMenuItem.separator())
         let quitItem = NSMenuItem(title: "Quit marble-peer", action: #selector(quitPeer), keyEquivalent: "q")
         quitItem.target = self
@@ -92,6 +102,16 @@ class TrayApp: NSObject, NSApplicationDelegate {
         let nconf = (st["confirm_count"] as? Int) ?? pending.count
         statusItem.title = "Status: \(state) (\(browser))"
         idItem.title = "Computer: \(cid)"
+        let lock = st["lock"] as? [String: Any] ?? [:]
+        let held = (lock["held"] as? Bool) ?? false
+        if held {
+            let name = (lock["holder_name"] as? String) ?? ""
+            let who = name.isEmpty ? ((lock["holder"] as? String) ?? "?") : name
+            lockItem.title = "Lock: held by \(who)"
+        } else {
+            lockItem.title = "Lock: free"
+        }
+        clearLockItem.isEnabled = held
         if let addr = st["miniui_addr"] as? String, !addr.isEmpty {
             miniUI = addr
             if statusURL.isEmpty {
@@ -132,6 +152,11 @@ class TrayApp: NSObject, NSApplicationDelegate {
 
     @objc func stopAction() {
         post("/stop")
+    }
+
+    @objc func clearLock() {
+        post("/lock/clear")
+        refresh()
     }
 
     @objc func quitPeer() {

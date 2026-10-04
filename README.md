@@ -460,16 +460,31 @@ marble-peer run --gui             # relaunch through the bundle (SSH escape hatc
 
 | Command | Purpose |
 |---------|---------|
-| `marble-peer pair` | Complete mutual pairing with a harness H-code |
+| `marble-peer pair` | Complete mutual pairing with a harness H-code (run again to add more harnesses) |
+| `marble-peer harnesses` | List paired harnesses |
 | `marble-peer run` | Long-running daemon (WS + actions + optional tray) |
 | `marble-peer run --gui` | macOS: relaunch through the app bundle to gain a GUI identity |
 | `marble-peer status` | Local JSON status + desktop availability |
-| `marble-peer unpair` | Clear local computer id + device token |
+| `marble-peer unpair [--harness URL]` | Remove one harness pairing, or all of them |
 | `marble-peer install-autostart` | Login start (Linux systemd --user / macOS app bundle + LaunchAgent / Windows Startup folder) |
 | `marble-peer install-autostart --trust-cert` | macOS: create a stable self-signed signing identity so permissions survive upgrades |
 | `marble-peer uninstall-autostart` | Remove login start (and the macOS app bundle) |
 | `marble-peer doctor` | Local probe: Chrome, desktop tools, lock state, macOS TCC, GUI identity, signing, screenshot |
 | `marble-peer version` | Print version (release builds inject tag/commit/date) |
+
+## Multiple harnesses and the peer lock
+
+One peer can be paired with several Marble harnesses: run `marble-peer pair`
+once per harness (or use **Pair** in the mini UI, which connects immediately).
+The peer stays connected to all of them, but only one harness at a time may
+drive the machine: a harness must **acquire the peer lock** before sending
+actions, and releases it when its turn ends. Others get
+`peer is locked by harness …` until then.
+
+If a harness crashes or hangs without releasing, the tray menu shows
+**Lock: held by …** and **Clear lock** (also on the mini UI, `POST /lock/clear`).
+Clearing stops the in-flight action. A harness that restarts drops its own stale
+lock automatically on reconnect.
 
 ## Design & protocol
 
@@ -484,7 +499,7 @@ marble-peer run --gui             # relaunch through the bundle (SSH escape hatc
 ## Security
 
 - Mini UI binds **127.0.0.1** only  
-- Device token stored mode **0600** in `~/.marble-peer/credentials` (Windows: private to your account via the user-profile ACL)  
+- Device tokens (one per harness) stored mode **0600** in `~/.marble-peer/credentials.json` (Windows: private to your account via the user-profile ACL)  
 - No cookie export; high-risk actions should use harness `computer_confirm`  
 - Do not commit `~/.marble-peer` or machine-specific harness URLs with secrets  
 

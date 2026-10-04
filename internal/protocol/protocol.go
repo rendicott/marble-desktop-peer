@@ -2,7 +2,10 @@ package protocol
 
 import "encoding/json"
 
-const Version = 1
+// Version 2 adds the peer lock (ADR-0021 multi-harness): harness → peer
+// {"type":"lock","kind":"acquire"|"release"}, peer → harness "lock_state", and
+// hello_ack instance_id / harness_name. A v1 harness gets an implicit lock.
+const Version = 2
 
 type Caps struct {
 	Browser bool `json:"browser"`
@@ -13,6 +16,9 @@ type Caps struct {
 	// peer-gui-loop-report (2026-09-23) so state (files, logs, config) is
 	// legible without reading screenshot pixels.
 	Exec bool `json:"exec"`
+	// Lock advertises protocol-v2 locking: actions are refused unless the
+	// sending harness holds the peer lock.
+	Lock bool `json:"lock"`
 }
 
 type Envelope struct {
@@ -33,4 +39,9 @@ type Envelope struct {
 	ScreenshotB64   string                 `json:"screenshot_b64,omitempty"`
 	Text            string                 `json:"text,omitempty"`
 	Meta            map[string]interface{} `json:"meta,omitempty"`
+	// InstanceID (hello_ack) identifies one harness process lifetime; a new id
+	// on reconnect means the harness restarted and any lock it held is stale.
+	InstanceID string `json:"instance_id,omitempty"`
+	// HarnessName (hello_ack) is a human label for the tray / mini UI.
+	HarnessName string `json:"harness_name,omitempty"`
 }

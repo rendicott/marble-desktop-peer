@@ -56,19 +56,40 @@ func main() {
 		}
 	case "status":
 		cfg, _ := config.Load()
-		tok, _ := config.LoadToken()
-		a := app.New(cfg, tok)
+		toks, _ := config.LoadTokens()
+		a := app.New(cfg, toks)
 		b, _ := json.MarshalIndent(a.StatusJSON(), "", "  ")
 		fmt.Println(string(b))
 		desk, note := desktop.Available()
 		fmt.Printf("desktop: %v (%s)\n", desk, note)
 	case "unpair":
+		fs := flag.NewFlagSet("unpair", flag.ExitOnError)
+		harness := fs.String("harness", "", "Harness URL to unpair (default: all)")
+		_ = fs.Parse(args)
 		cfg, _ := config.Load()
-		cfg.ComputerID = ""
-		cfg.HarnessURL = ""
+		if *harness == "" {
+			cfg.Harnesses = nil
+		} else if !cfg.RemoveHarness(*harness) {
+			fmt.Fprintf(os.Stderr, "unpair: not paired with %s\n", *harness)
+			os.Exit(1)
+		}
 		_ = config.Save(cfg)
-		_ = config.ClearToken()
-		fmt.Println("unpaired local credentials")
+		_ = config.ClearToken(config.NormalizeURL(*harness))
+		if *harness == "" {
+			fmt.Println("unpaired all harnesses")
+		} else {
+			fmt.Println("unpaired", config.NormalizeURL(*harness), "— restart marble-peer run to disconnect")
+		}
+	case "harnesses":
+		cfg, _ := config.Load()
+		toks, _ := config.LoadTokens()
+		for _, h := range cfg.Harnesses {
+			cred := "token"
+			if toks[h.URL] == "" {
+				cred = "NO TOKEN (re-pair)"
+			}
+			fmt.Printf("%s\tcomputer_id=%s\t%s\n", h.URL, h.ComputerID, cred)
+		}
 	case "run":
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		killBrowser := fs.Bool("kill-browser-on-exit", false, "Kill Chrome only if marble-peer launched it")
@@ -147,12 +168,13 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `marble-peer — desktop agent for Marble (ADR-0021)
 
 Commands:
-  pair --harness URL --code H-XXXXXX [--allow-http]
+  pair --harness URL --code H-XXXXXX [--allow-http]   # adds a harness; pair again for more
   pair --serve
   run [--kill-browser-on-exit] [--no-miniui] [--no-tray]
   status
+  harnesses                       # list paired harnesses
   doctor [--open-settings] [--request-perms=false] [--screenshot=false]
-  unpair
+  unpair [--harness URL]          # one harness, or all
   install-autostart [--no-enable]   # login start (LaunchAgent / systemd --user / Windows Startup)
   uninstall-autostart
   print-chrome-cmd
@@ -201,8 +223,8 @@ func runDaemon(killBrowser, miniui, useTray bool, browserMode string, cdpPort in
 	}
 	_ = config.Save(cfg)
 
-	tok, err := config.LoadToken()
-	if err != nil || tok == "" {
+	toks, err := config.LoadTokens()
+	if err != nil || len(cfg.Harnesses) == 0 || len(toks) == 0 {
 		log.Fatal("not paired — run: marble-peer pair --harness … --code …")
 	}
 	if err := app.EnsureDeviceID(&cfg); err != nil {
@@ -212,7 +234,7 @@ func runDaemon(killBrowser, miniui, useTray bool, browserMode string, cdpPort in
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	a := app.New(cfg, tok)
+	a := app.New(cfg, toks)
 
 	var miniMu sync.Mutex
 	miniAddr := ""
@@ -259,8 +281,9 @@ func runDaemon(killBrowser, miniui, useTray bool, browserMode string, cdpPort in
 					return getMini()
 				},
 				StopAction: func() { a.Q.Cancel() },
+				ClearLock:  func() { a.ClearLock() },
 				Quit:       cancel,
-				ComputerID: func() string { return a.Cfg.ComputerID },
+				ComputerID: a.ComputerIDs,
 			})
 			if err != nil && ctx.Err() == nil {
 				log.Printf("tray: %v", err)
@@ -353,6 +376,7 @@ func serveMiniUI(ctx context.Context, a *app.App, cancel context.CancelFunc) (st
 <h1 style="margin-top:0">marble-peer</h1>
 %s
 %s
+%s
 <pre style="background:#171a21;padding:1rem;border-radius:8px;overflow:auto">%s</pre>
 <p>
   <a style="color:#7c9cff" href="/pair">Pair</a> ·
@@ -361,7 +385,7 @@ func serveMiniUI(ctx context.Context, a *app.App, cancel context.CancelFunc) (st
   <form style="display:inline" method=post action="/quit"><button>Quit</button></form>
 </p>
 <p style="color:#6b7280;font-size:0.85rem">When the agent calls <code>computer_confirm</code>, a notification opens and this page shows Accept/Deny. Default is deny after 120s.</p>
-</body>`, banner, macosPermsHTML(st), string(b))
+</body>`, banner, lockHTML(a.LockInfo()), macosPermsHTML(st), string(b))
 	})
 	mux.HandleFunc("/status.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -378,6 +402,19 @@ func serveMiniUI(ctx context.Context, a *app.App, cancel context.CancelFunc) (st
 		}
 		a.Q.Cancel()
 		fmt.Fprint(w, "ok")
+	})
+	mux.HandleFunc("/lock/clear", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		prev := a.ClearLock()
+		if strings.Contains(r.Header.Get("Accept"), "text/html") {
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "was": prev})
 	})
 	mux.HandleFunc("/macos-perms", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost && r.Method != http.MethodGet {
@@ -418,7 +455,7 @@ func runPairServe() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	cfg, _ := config.Load()
-	a := app.New(cfg, "")
+	a := app.New(cfg, nil)
 	if _, err := serveMiniUI(ctx, a, cancel); err != nil {
 		log.Fatal(err)
 	}
@@ -430,6 +467,25 @@ func htmlEsc(s string) string {
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, `"`, "&quot;")
 	return s
+}
+
+func lockHTML(l app.LockInfo) string {
+	if !l.Held {
+		return `<p style="color:#9aa3b5">Lock: <b style="color:#16a34a">free</b> — any paired harness may take control.</p>`
+	}
+	who := l.Holder
+	if l.HolderName != "" {
+		who = l.HolderName + " (" + l.Holder + ")"
+	}
+	since := ""
+	if l.Since != nil {
+		since = " since " + l.Since.Local().Format("15:04:05")
+	}
+	return fmt.Sprintf(`<div style="background:#171a21;border:1px solid #2a3140;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.25rem">
+<p style="margin:0">Lock: <b style="color:#f59e0b">held by %s</b>%s</p>
+<p style="margin:0.5rem 0 0;color:#9aa3b5;font-size:0.85rem">Other harnesses cannot use this machine until it is released. Clear it if that harness crashed or is stuck.</p>
+<form style="margin:0.75rem 0 0" method=post action="/lock/clear"><button>Clear lock</button></form>
+</div>`, htmlEsc(who), htmlEsc(since))
 }
 
 func macosPermsHTML(st map[string]interface{}) string {

@@ -19,7 +19,7 @@ import (
 //go:embed tray_darwin.swift
 var traySwift []byte
 
-const trayHelperVersion = "1"
+const trayHelperVersion = "2"
 
 func startPlatform(ctx context.Context, h Hooks) error {
 	if _, err := exec.LookPath("swiftc"); err != nil {

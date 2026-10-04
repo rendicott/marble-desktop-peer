@@ -10,17 +10,68 @@ import (
 )
 
 type File struct {
-	HarnessURL  string `json:"harness_url"`
-	DeviceID    string `json:"device_id"`
-	ComputerID  string `json:"computer_id"`
-	LogLevel    string `json:"log_level"`
-	MiniUIPort  int    `json:"miniui_port"`
-	KillBrowser bool   `json:"kill_browser_on_exit"`
+	// HarnessURL / ComputerID are the pre-multi-harness single pairing. Load
+	// migrates them into Harnesses; they are never written back.
+	HarnessURL string `json:"harness_url,omitempty"`
+	ComputerID string `json:"computer_id,omitempty"`
+	// Harnesses is every Marble harness this peer is paired with. The peer
+	// connects to all of them; a harness must hold the peer lock to drive it.
+	Harnesses   []Harness `json:"harnesses,omitempty"`
+	DeviceID    string    `json:"device_id"`
+	LogLevel    string    `json:"log_level"`
+	MiniUIPort  int       `json:"miniui_port"`
+	KillBrowser bool      `json:"kill_browser_on_exit"`
 	// BrowserMode: "user" (default) = real Chrome profile / attach CDP;
 	// "marble" = isolated ~/.marble-peer/chrome-profile (no daily logins).
 	BrowserMode string `json:"browser_mode,omitempty"`
 	// CDPPort: prefer attach to this port (0 = auto 9222/…); env MARBLE_PEER_CDP_PORT overrides.
 	CDPPort int `json:"cdp_port,omitempty"`
+}
+
+// Harness is one paired Marble harness. Its device token lives in credentials.json.
+type Harness struct {
+	URL        string `json:"url"`
+	ComputerID string `json:"computer_id"`
+}
+
+// NormalizeURL is the key used for a harness in config and credentials.
+func NormalizeURL(u string) string {
+	return strings.TrimRight(strings.TrimSpace(u), "/")
+}
+
+// Harness returns the pairing for url, if any.
+func (f File) Harness(url string) (Harness, bool) {
+	url = NormalizeURL(url)
+	for _, h := range f.Harnesses {
+		if h.URL == url {
+			return h, true
+		}
+	}
+	return Harness{}, false
+}
+
+// UpsertHarness adds or replaces the pairing for h.URL.
+func (f *File) UpsertHarness(h Harness) {
+	h.URL = NormalizeURL(h.URL)
+	for i := range f.Harnesses {
+		if f.Harnesses[i].URL == h.URL {
+			f.Harnesses[i] = h
+			return
+		}
+	}
+	f.Harnesses = append(f.Harnesses, h)
+}
+
+// RemoveHarness drops the pairing for url; reports whether one existed.
+func (f *File) RemoveHarness(url string) bool {
+	url = NormalizeURL(url)
+	for i, h := range f.Harnesses {
+		if h.URL == url {
+			f.Harnesses = append(f.Harnesses[:i], f.Harnesses[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 func Home() string {
@@ -46,8 +97,41 @@ func Load() (File, error) {
 		}
 		return f, err
 	}
-	err = json.Unmarshal(b, &f)
-	return f, err
+	if err := json.Unmarshal(b, &f); err != nil {
+		return f, err
+	}
+	if f.HarnessURL != "" {
+		if err := migrateLegacy(&f); err != nil {
+			return f, err
+		}
+	}
+	return f, nil
+}
+
+// migrateLegacy moves the single-harness pairing (harness_url + computer_id in
+// config.json, raw token in credentials) into Harnesses + credentials.json.
+func migrateLegacy(f *File) error {
+	url := NormalizeURL(f.HarnessURL)
+	if _, ok := f.Harness(url); !ok {
+		f.UpsertHarness(Harness{URL: url, ComputerID: f.ComputerID})
+	}
+	if b, err := os.ReadFile(legacyCredsPath()); err == nil {
+		if tok := strings.TrimSpace(string(b)); tok != "" {
+			toks, _ := LoadTokens()
+			if toks[url] == "" {
+				if err := SaveToken(url, tok); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	f.HarnessURL = ""
+	f.ComputerID = ""
+	if err := Save(*f); err != nil {
+		return err
+	}
+	_ = os.Remove(legacyCredsPath())
+	return nil
 }
 
 func Save(f File) error {
@@ -61,26 +145,56 @@ func Save(f File) error {
 	return os.WriteFile(Path(), b, 0o600)
 }
 
-func CredsPath() string { return filepath.Join(Home(), "credentials") }
+// CredsPath holds device tokens keyed by harness URL (mode 0600).
+func CredsPath() string { return filepath.Join(Home(), "credentials.json") }
 
-func LoadToken() (string, error) {
+// legacyCredsPath is the pre-multi-harness raw single token.
+func legacyCredsPath() string { return filepath.Join(Home(), "credentials") }
+
+// LoadTokens returns device tokens keyed by normalized harness URL.
+func LoadTokens() (map[string]string, error) {
+	out := map[string]string{}
 	b, err := os.ReadFile(CredsPath())
 	if err != nil {
-		return "", err
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return out, err
 	}
-	return string(b), nil
+	if err := json.Unmarshal(b, &out); err != nil {
+		return map[string]string{}, err
+	}
+	return out, nil
 }
 
-func SaveToken(tok string) error {
+func writeTokens(m map[string]string) error {
 	if err := EnsureHome(); err != nil {
 		return err
 	}
-	return os.WriteFile(CredsPath(), []byte(tok), 0o600)
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(CredsPath(), b, 0o600)
 }
 
-func ClearToken() error {
-	_ = os.Remove(CredsPath())
-	return nil
+// SaveToken stores the device token for one harness.
+func SaveToken(harnessURL, tok string) error {
+	m, _ := LoadTokens()
+	m[NormalizeURL(harnessURL)] = tok
+	return writeTokens(m)
+}
+
+// ClearToken removes one harness token, or all of them when harnessURL is "".
+func ClearToken(harnessURL string) error {
+	if harnessURL == "" {
+		_ = os.Remove(CredsPath())
+		_ = os.Remove(legacyCredsPath())
+		return nil
+	}
+	m, _ := LoadTokens()
+	delete(m, NormalizeURL(harnessURL))
+	return writeTokens(m)
 }
 
 // LockPath is the single-instance flock for `marble-peer run`.

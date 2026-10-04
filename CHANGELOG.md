@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Pair with multiple harnesses; peer lock
+
+- A peer can be paired with several Marble harnesses (`marble-peer pair` per
+  harness; `marble-peer harnesses` lists them; `unpair --harness URL` removes
+  one). Existing single-harness `config.json` + `credentials` migrate
+  automatically to `harnesses[]` + `credentials.json` on first load.
+- Protocol v2 peer lock: only the harness holding the lock may send actions.
+  v1 harnesses get an implicit lock (dropped on disconnect / 2 min idle).
+- Tray (Linux/macOS/Windows) and mini UI show the lock holder and offer
+  **Clear lock** for a harness that failed to release it.
+
 ### macOS: fix screen capture and make permissions survive upgrades
 
 macOS would not let the peer capture the screen at all in the common

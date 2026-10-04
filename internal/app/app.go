@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 	"github.com/rendicott/marble-desktop-peer/internal/browser"
 	"github.com/rendicott/marble-desktop-peer/internal/config"
 	"github.com/rendicott/marble-desktop-peer/internal/desktop"
@@ -29,21 +28,24 @@ import (
 	"github.com/rendicott/marble-desktop-peer/internal/shellexec"
 )
 
-// App is the long-running peer daemon.
+// App is the long-running peer daemon. It holds one link per paired harness;
+// the links share the action queue, browser and peer lock.
 type App struct {
 	Cfg     config.File
-	Token   string
 	Browser *browser.Manager
 	Q       *queue.Queue
 
 	mu     sync.Mutex
-	state  string
-	ws     *websocket.Conn
-	cancel context.CancelFunc
+	links  []*link
+	runCtx context.Context // set by Run; links added later (mini UI pair) start under it
 
-	// writeMu serializes all websocket writes. gorilla/websocket panics on concurrent writers
-	// ("concurrent write to websocket connection") — ping/pong + action results race without this.
-	writeMu sync.Mutex
+	// peer lock (lock.go)
+	lockMu       sync.Mutex
+	lockHolder   *link
+	lockInstance string
+	lockSince    time.Time
+	lockLastUse  time.Time
+	lockImplicit bool
 
 	// confirm
 	confirmMu   sync.Mutex
@@ -62,23 +64,28 @@ type ConfirmRequest struct {
 	NotifID   uint32    `json:"-"` // desktop notification id (withdraw on resolve)
 }
 
-func New(cfg config.File, token string) *App {
+// New builds the daemon for every harness in cfg that has a token.
+func New(cfg config.File, tokens map[string]string) *App {
 	mode := cfg.BrowserMode
 	if mode == "" {
 		mode = browser.ModeUser
 	}
-	return &App{
-		Cfg:   cfg,
-		Token: token,
+	a := &App{
+		Cfg: cfg,
 		Browser: browser.NewWithOptions(browser.Options{
 			Mode:    mode,
 			CDPPort: cfg.CDPPort,
 		}),
 		Q:           queue.New(),
-		state:       "Offline",
 		confirmCh:   make(map[string]chan bool),
 		confirmMeta: make(map[string]ConfirmRequest),
 	}
+	for _, h := range cfg.Harnesses {
+		if tok := tokens[h.URL]; tok != "" {
+			a.links = append(a.links, newLink(a, h, tok))
+		}
+	}
+	return a
 }
 
 func (a *App) caps() protocol.Caps {
@@ -88,12 +95,20 @@ func (a *App) caps() protocol.Caps {
 		Desktop: desk,
 		Confirm: true,
 		Exec:    true, // os/exec shells out on every platform — no extra probe needed
+		Lock:    true,
 	}
 }
 
-// Run connects WS and serves actions until ctx done.
+// Links returns the current harness links.
+func (a *App) Links() []*link {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]*link(nil), a.links...)
+}
+
+// Run connects to every paired harness and serves actions until ctx done.
 func (a *App) Run(ctx context.Context) error {
-	if a.Cfg.HarnessURL == "" || a.Token == "" || a.Cfg.DeviceID == "" {
+	if len(a.Links()) == 0 || a.Cfg.DeviceID == "" {
 		return fmt.Errorf("not paired — run: marble-peer pair")
 	}
 	// Keep display/session awake so XWayland and desktop input survive idle blanking.
@@ -114,187 +129,101 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}()
 
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err := a.session(ctx); err != nil {
-			log.Printf("ws session: %v — retry in 3s", err)
-			a.setState("Offline")
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(3 * time.Second):
-			}
-			continue
-		}
-		// clean session end (should be rare) — reconnect
-		log.Printf("ws session ended cleanly; reconnecting")
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-		}
-	}
-}
-
-func (a *App) setState(s string) {
 	a.mu.Lock()
-	a.state = s
+	a.runCtx = ctx
+	for _, l := range a.links {
+		go l.run(ctx)
+	}
 	a.mu.Unlock()
-	log.Printf("state=%s", s)
+	<-ctx.Done()
+	return ctx.Err()
 }
 
-func (a *App) State() string {
+// ReloadHarnesses picks up pairings added or replaced on disk (mini UI pair)
+// without restarting the daemon.
+func (a *App) ReloadHarnesses() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	tokens, err := config.LoadTokens()
+	if err != nil {
+		return err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.state
-}
-
-// wsWrite serializes all writes on the active peer↔harness connection.
-// Must be used for every WriteJSON after the connection is stored on a.ws.
-func (a *App) wsWrite(v interface{}) error {
-	a.mu.Lock()
-	w := a.ws
-	a.mu.Unlock()
-	if w == nil {
-		return fmt.Errorf("websocket not connected")
-	}
-	a.writeMu.Lock()
-	defer a.writeMu.Unlock()
-	_ = w.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	err := w.WriteJSON(v)
-	_ = w.SetWriteDeadline(time.Time{})
-	return err
-}
-
-func (a *App) session(ctx context.Context) error {
-	u, err := wsURL(a.Cfg.HarnessURL, a.Cfg.DeviceID, a.Token)
-	if err != nil {
-		return err
-	}
-	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
-	ws, _, err := dialer.DialContext(ctx, u, nil)
-	if err != nil {
-		return err
-	}
-	a.mu.Lock()
-	a.ws = ws
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		a.ws = nil
-		a.mu.Unlock()
-		// Close under write lock so no writer races with Close.
-		a.writeMu.Lock()
-		_ = ws.Close()
-		a.writeMu.Unlock()
-	}()
-
-	caps := a.caps()
-	hello := protocol.Envelope{
-		Type:            "hello",
-		ProtocolVersion: protocol.Version,
-		DeviceID:        a.Cfg.DeviceID,
-		Token:           a.Token,
-		OS:              runtime.GOOS,
-		PeerVersion:     PeerVersion,
-		Caps:            &caps,
-	}
-	if err := a.wsWrite(hello); err != nil {
-		return err
-	}
-	_, data, err := ws.ReadMessage()
-	if err != nil {
-		return err
-	}
-	var ack protocol.Envelope
-	if err := json.Unmarshal(data, &ack); err != nil || ack.Type != "hello_ack" {
-		return fmt.Errorf("expected hello_ack")
-	}
-	if ack.ComputerID != "" {
-		a.Cfg.ComputerID = ack.ComputerID
-		_ = config.Save(a.Cfg)
-	}
-	a.setState("Online")
-	log.Printf("connected as computer_id=%s", a.Cfg.ComputerID)
-
-	// Client-side keepalive as backup if hub pings are missing.
-	// Uses wsWrite so it never races pong/result writers.
-	stopPing := make(chan struct{})
-	defer close(stopPing)
-	go func() {
-		t := time.NewTicker(30 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-stopPing:
-				return
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if err := a.wsWrite(protocol.Envelope{Type: "ping"}); err != nil {
-					return
+	for _, h := range cfg.Harnesses {
+		tok := tokens[h.URL]
+		if tok == "" {
+			continue
+		}
+		var cur *link
+		for _, l := range a.links {
+			if l.url == h.URL {
+				cur = l
+			}
+		}
+		if cur != nil {
+			cur.mu.Lock()
+			same := cur.token == tok
+			cur.mu.Unlock()
+			if same {
+				continue
+			}
+			// Re-paired: replace the link so it reconnects with the new token.
+			cur.stop()
+			for i, l := range a.links {
+				if l == cur {
+					a.links = append(a.links[:i], a.links[i+1:]...)
+					break
 				}
 			}
 		}
-	}()
+		l := newLink(a, h, tok)
+		a.links = append(a.links, l)
+		if a.runCtx != nil {
+			go l.run(a.runCtx)
+		}
+		log.Printf("harness %s added", h.URL)
+	}
+	a.Cfg.Harnesses = cfg.Harnesses
+	return nil
+}
 
-	for {
-		_ = ws.SetReadDeadline(time.Now().Add(90 * time.Second))
-		_, data, err := ws.ReadMessage()
-		if err != nil {
-			return err
-		}
-		var env protocol.Envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			continue
-		}
-		switch env.Type {
-		case "ping":
-			if err := a.wsWrite(protocol.Envelope{Type: "pong"}); err != nil {
-				return err
-			}
-		case "pong":
-			// hub keepalive reply
-		case "cancel":
-			a.Q.Cancel()
-		case "confirm_resolve":
-			// Human accepted/denied from Marble harness UI (not only peer mini-UI).
-			_ = a.ResolveConfirm(env.ID, env.OK)
-			log.Printf("CONFIRM resolve from harness id=%s accept=%v", env.ID, env.OK)
-		case "action":
-			go a.handleAction(env)
-		}
+// saveComputerID persists a computer_id the harness reported in hello_ack.
+func (a *App) saveComputerID(url, computerID string) {
+	cfg, err := config.Load()
+	if err != nil {
+		return
+	}
+	if h, ok := cfg.Harness(url); ok {
+		h.ComputerID = computerID
+		cfg.UpsertHarness(h)
+		_ = config.Save(cfg)
 	}
 }
 
-func (a *App) handleAction(env protocol.Envelope) {
-	deadline := time.Duration(env.DeadlineMS) * time.Millisecond
-	if deadline <= 0 {
-		deadline = 120 * time.Second
-	}
-	if deadline > 5*time.Minute {
-		deadline = 5 * time.Minute
-	}
-	parent, cancel := context.WithTimeout(context.Background(), deadline)
-	defer cancel()
-
-	err := a.Q.Run(parent, func(ctx context.Context) error {
-		res := a.exec(ctx, env)
-		res.Type = "result"
-		res.ID = env.ID
-		if werr := a.wsWrite(res); werr != nil {
-			return werr
+// State is "Online" when at least one harness is connected.
+func (a *App) State() string {
+	for _, l := range a.Links() {
+		if l.status().State == "Online" {
+			return "Online"
 		}
-		return nil
-	})
-	if err != nil {
-		// Queue rejected (busy/cancel) or write failed — still try to surface error once.
-		_ = a.wsWrite(protocol.Envelope{
-			Type: "result", ID: env.ID, OK: false, Error: err.Error(),
-		})
 	}
+	return "Offline"
+}
+
+// ComputerIDs labels this machine across harnesses (tray tooltip).
+func (a *App) ComputerIDs() string {
+	var ids []string
+	seen := map[string]bool{}
+	for _, l := range a.Links() {
+		if cid := l.status().ComputerID; cid != "" && !seen[cid] {
+			seen[cid] = true
+			ids = append(ids, cid)
+		}
+	}
+	return strings.Join(ids, ", ")
 }
 
 func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope {
@@ -802,13 +731,18 @@ func (a *App) StatusJSON() map[string]interface{} {
 	desk, deskNote, browserOK := cachedStatusProbes(a)
 	mini := a.miniUIBase()
 	pending := a.PendingConfirms()
+	harnesses := []HarnessStatus{}
+	for _, l := range a.Links() {
+		harnesses = append(harnesses, l.status())
+	}
 	m := map[string]interface{}{
 		"state":            a.State(),
-		"computer_id":      a.Cfg.ComputerID,
+		"computer_id":      a.ComputerIDs(),
 		"device_id":        a.Cfg.DeviceID,
-		"harness_url":      a.Cfg.HarnessURL,
+		"harnesses":        harnesses,
+		"lock":             a.LockInfo(),
 		"peer_version":     PeerVersion,
-		"caps":             protocol.Caps{Browser: browserOK, Desktop: desk, Confirm: true, Exec: true},
+		"caps":             protocol.Caps{Browser: browserOK, Desktop: desk, Confirm: true, Exec: true, Lock: true},
 		"desktop_note":     deskNote,
 		"desktop_ok":       desk,
 		"browser_ok":       browserOK,
@@ -908,11 +842,16 @@ func (a *App) handlePairUI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		fmt.Fprint(w, "paired — restart marble-peer run")
+		if err := a.ReloadHarnesses(); err != nil {
+			fmt.Fprintf(w, "paired — restart marble-peer run to connect (%v)", err)
+			return
+		}
+		fmt.Fprint(w, "paired — connecting")
 		return
 	}
 	fmt.Fprint(w, `<!doctype html><body style="font-family:system-ui;background:#111;color:#eee;padding:2rem">
 <h2>Pair with Marble</h2>
+<p style="color:#9aa3b5">A peer can be paired with several harnesses. Pairing with a new harness adds it; re-pairing an existing harness URL replaces its credentials.</p>
 <form method=post>
 <label>Harness URL <input name=harness_url style="width:100%" placeholder="http://127.0.0.1:8080"></label><br><br>
 <label>H-code <input name=h_code></label><br><br>
@@ -921,9 +860,10 @@ func (a *App) handlePairUI(w http.ResponseWriter, r *http.Request) {
 </form></body>`)
 }
 
-// Pair performs mutual handshake join + poll until sealed.
+// Pair performs mutual handshake join + poll until sealed, then adds (or
+// replaces) the harness in the peer's pairing list.
 func Pair(harnessURL, hCode string, allowHTTP bool) error {
-	harnessURL = strings.TrimRight(strings.TrimSpace(harnessURL), "/")
+	harnessURL = config.NormalizeURL(harnessURL)
 	hCode = strings.ToUpper(strings.TrimSpace(hCode))
 	if harnessURL == "" || hCode == "" {
 		return fmt.Errorf("harness_url and h_code required")
@@ -988,12 +928,13 @@ func Pair(harnessURL, hCode string, allowHTTP bool) error {
 		_ = json.NewDecoder(r.Body).Decode(&st)
 		r.Body.Close()
 		if st.Status == "sealed" && st.DeviceToken != "" {
-			cfg.HarnessURL = harnessURL
-			cfg.ComputerID = st.ComputerID
-			if err := config.Save(cfg); err != nil {
+			if err := config.SaveToken(harnessURL, st.DeviceToken); err != nil {
 				return err
 			}
-			if err := config.SaveToken(st.DeviceToken); err != nil {
+			// Reload: the token save must not race a stale cfg copy.
+			cfg, _ = config.Load()
+			cfg.UpsertHarness(config.Harness{URL: harnessURL, ComputerID: st.ComputerID})
+			if err := config.Save(cfg); err != nil {
 				return err
 			}
 			fmt.Printf("Paired as computer_id=%s\n", st.ComputerID)

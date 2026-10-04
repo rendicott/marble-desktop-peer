@@ -73,11 +73,15 @@ $itemStatus = $menu.Items.Add('Status: starting...')
 $itemStatus.Enabled = $false
 $itemId = $menu.Items.Add('Computer: -')
 $itemId.Enabled = $false
+$itemLock = $menu.Items.Add('Lock: -')
+$itemLock.Enabled = $false
 [void]$menu.Items.Add('-')
 $itemConfirm = $menu.Items.Add('No pending confirmations')
 $itemConfirm.Enabled = $false
 $itemOpen = $menu.Items.Add('Open mini UI')
 $itemStop = $menu.Items.Add('Stop current action')
+$itemClearLock = $menu.Items.Add('Clear lock')
+$itemClearLock.Enabled = $false
 [void]$menu.Items.Add('-')
 $itemQuit = $menu.Items.Add('Quit marble-peer')
 
@@ -130,6 +134,16 @@ function Update-Tray {
 
     $itemStatus.Text = "Status: $state ($browser)"
     $itemId.Text = "Computer: $cid"
+    $held = $false
+    if ($st.lock -and $st.lock.held) { $held = $true }
+    if ($held) {
+        $who = [string]$st.lock.holder
+        if ($st.lock.holder_name) { $who = [string]$st.lock.holder_name }
+        $itemLock.Text = "Lock: held by $who"
+    } else {
+        $itemLock.Text = 'Lock: free'
+    }
+    $itemClearLock.Enabled = $held
     if ($n -gt 0) {
         $itemConfirm.Text = "(!) Confirm action ($n) - click"
         $itemConfirm.Enabled = $true
@@ -154,6 +168,10 @@ function Update-Tray {
 $itemConfirm.add_Click({ Open-Confirm })
 $itemOpen.add_Click({ Open-Url (Get-BaseUrl (Get-PeerStatus)) })
 $itemStop.add_Click({ [void](Invoke-PeerPost '/stop') })
+$itemClearLock.add_Click({
+    [void](Invoke-PeerPost '/lock/clear')
+    try { Update-Tray } catch { [Console]::Error.WriteLine("tray refresh: $_") }
+})
 $itemQuit.add_Click({
     # Prefer the HTTP quit so the daemon flushes logs and exits 0.
     if (-not (Invoke-PeerPost '/quit') -and $parentPid -gt 0) {

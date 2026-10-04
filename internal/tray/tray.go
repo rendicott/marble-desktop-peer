@@ -14,6 +14,8 @@ type Hooks struct {
 	MiniUIAddr func() string
 	// StopAction cancels the current peer action queue item.
 	StopAction func()
+	// ClearLock force-releases the peer lock (a harness that never released it).
+	ClearLock func()
 	// Quit requests a graceful process exit (exit 0 so systemd does not restart).
 	Quit func()
 	// ComputerID optional label for tooltip.

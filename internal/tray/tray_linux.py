@@ -49,6 +49,14 @@ def fetch_status(url: str) -> dict:
         return {}
 
 
+def lock_label(st: dict) -> str:
+    lock = st.get("lock") or {}
+    if not lock.get("held"):
+        return "Lock: free"
+    who = lock.get("holder_name") or lock.get("holder") or "?"
+    return f"Lock: held by {who}"
+
+
 def main() -> None:
     parent = int(os.environ.get("MARBLE_PEER_PID", "0") or "0")
     status_url = os.environ.get("MARBLE_PEER_STATUS_URL", "")
@@ -79,6 +87,10 @@ def main() -> None:
     item_id = Gtk.MenuItem(label="Computer: —")
     item_id.set_sensitive(False)
     menu.append(item_id)
+
+    item_lock = Gtk.MenuItem(label="Lock: —")
+    item_lock.set_sensitive(False)
+    menu.append(item_lock)
 
     menu.append(Gtk.SeparatorMenuItem())
 
@@ -129,6 +141,25 @@ def main() -> None:
     item_stop.connect("activate", on_stop)
     menu.append(item_stop)
 
+    item_clear = Gtk.MenuItem(label="Clear lock")
+    item_clear.set_sensitive(False)
+    def on_clear(_w):
+        st = fetch_status(status_url)
+        base = st.get("miniui_addr") or miniui
+        if not base:
+            return
+        try:
+            req = urllib.request.Request(
+                base.rstrip("/") + "/lock/clear",
+                data=b"",
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=3).read()
+        except Exception as e:
+            sys.stderr.write(f"tray clear lock: {e}\n")
+    item_clear.connect("activate", on_clear)
+    menu.append(item_clear)
+
     menu.append(Gtk.SeparatorMenuItem())
 
     item_quit = Gtk.MenuItem(label="Quit marble-peer")
@@ -170,6 +201,8 @@ def main() -> None:
             nconf = st.get("confirm_count") or len(pending)
             item_status.set_label(f"Status: {state} ({browser})")
             item_id.set_label(f"Computer: {cid}")
+            item_lock.set_label(lock_label(st))
+            item_clear.set_sensitive(bool((st.get("lock") or {}).get("held")))
             if nconf:
                 item_confirm.set_label(f"⚠️ Confirm action ({nconf}) — click")
                 item_confirm.set_sensitive(True)
