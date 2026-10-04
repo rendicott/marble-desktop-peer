@@ -307,9 +307,9 @@ func CreateSelfSignedCert() error {
 			err, strings.TrimSpace(string(out)))
 	}
 	if !selfSignedCertUsable() {
-		return fmt.Errorf("certificate created but codesign still cannot use it; " +
-			"open Keychain Access → login → \"%s\" → Get Info → Trust → " +
-			"set \"Code Signing\" to Always Trust")
+		return fmt.Errorf("certificate created but codesign still cannot use it; "+
+			"open Keychain Access → login → \"%s\" → Get Info → Trust → "+
+			"set \"Code Signing\" to Always Trust", darwinSelfSignedCN)
 	}
 	return nil
 }
