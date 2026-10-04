@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+## [v0.2.1] — 2026-10-04
+
+### macOS: installing over a signed bundle no longer asks for a keychain password
+
+`install-autostart` re-signed the app bundle unconditionally. On a Mac with a
+secondary signing keychain, `security find-identity` would offer a Developer ID
+from that keychain, and `codesign` would then stop on a modal
+
+> codesign wants to use the "orb-codesign" keychain. Please enter the keychain
+> password.
+
+dialog the user has no way to answer — the password belongs to a keychain they
+never set up interactively. The install hung until cancelled, and cancelling
+dropped the bundle to ad-hoc signing, silently throwing away the release's
+Developer ID signature, hardened-runtime flag and timestamp.
+
+- An app bundle that already carries a valid, non-ad-hoc signature is now **left
+  alone**. Installing the released `.app.zip` keeps its Developer ID signature,
+  and the installer makes no signing call at all.
+- When signing *is* needed, only the **default keychain** is used, and `codesign`
+  is confined to it with `--keychain`; the keychain list is never searched. A
+  locked default keychain may still prompt, but that is the user's login
+  keychain, whose password they know.
+- `codesign` now runs with a deadline, so no prompt can hang an install.
+- Stale `codesign` scratch files (`.cstemp`) are cleared before signing; one left
+  by an interrupted run makes `codesign --verify` fail with
+  `a sealed resource is missing or invalid`.
+- `install-autostart` reports what happened to the signature in every mode,
+  including `--no-enable`.
+
 ## [v0.2.0] — 2026-10-03
 
 ### Pair with multiple harnesses; peer lock

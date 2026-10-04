@@ -3,12 +3,14 @@
 package autostart
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // macOS autostart + GUI-session launch.
@@ -67,11 +69,11 @@ func darwinLogPath() string {
 // Because the binary is copied, install-autostart must be re-run after
 // upgrading marble-peer. `marble-peer doctor` detects a stale bundle and says
 // so.
-func writeAppBundle(exe string) ([]string, error) {
+func writeAppBundle(exe string) ([]string, SigningOutcome, error) {
 	app := darwinAppDir()
 	macOSDir := filepath.Join(app, "Contents", "MacOS")
 	if err := os.MkdirAll(macOSDir, 0o755); err != nil {
-		return nil, err
+		return nil, SigningOutcome{}, err
 	}
 
 	infoPlist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -93,7 +95,7 @@ func writeAppBundle(exe string) ([]string, error) {
 `, darwinBundleID)
 	infoPath := filepath.Join(app, "Contents", "Info.plist")
 	if err := os.WriteFile(infoPath, []byte(infoPlist), 0o644); err != nil {
-		return nil, err
+		return nil, SigningOutcome{}, err
 	}
 
 	// Copy the real binary in as the bundle executable.
@@ -105,7 +107,7 @@ func writeAppBundle(exe string) ([]string, error) {
 	binPath := filepath.Join(macOSDir, "MarblePeer")
 	if !sameFile(exe, binPath) {
 		if err := copyFile(exe, binPath, 0o755); err != nil {
-			return nil, fmt.Errorf("copy binary into bundle: %w", err)
+			return nil, SigningOutcome{}, fmt.Errorf("copy binary into bundle: %w", err)
 		}
 	}
 
@@ -117,16 +119,44 @@ func writeAppBundle(exe string) ([]string, error) {
 	// grants and they must re-grant. That is the single worst part of the
 	// macOS experience.
 	//
-	// Instead we sign with a persistent self-signed certificate created once
-	// in the user's login keychain. The certificate identity is stable across
-	// rebuilds, so TCC grants survive upgrades. A real Developer ID is used
-	// automatically if one is present.
-	signBundle(app)
+	// Instead we keep or create a persistent signature: a released .app bundle
+	// is already Developer ID signed and is left untouched; otherwise we sign
+	// with a stable self-signed certificate created once in the user's login
+	// keychain, or a real Developer ID when one is usable.
+	outcome := signBundle(app)
 
-	return []string{infoPath, binPath}, nil
+	return []string{infoPath, binPath}, outcome, nil
 }
 
-// signBundle signs the app bundle with the best available identity.
+// SigningOutcome records what signBundle did, so install output can be honest
+// about the state of the bundle's code signature.
+type SigningOutcome struct {
+	// Action is one of: "kept", "developer-id", "self-signed", "adhoc".
+	Action string
+	// Identity is the certificate name or hash used, when one was.
+	Identity string
+}
+
+// InstallMessage is the one-line signing summary appended to install output.
+func (o SigningOutcome) InstallMessage() string {
+	switch o.Action {
+	case "kept":
+		return "\nkept the bundle's existing signature (" + o.Identity +
+			") — permissions will survive upgrades"
+	case "developer-id":
+		return "\nsigned with your Developer ID — permissions will survive upgrades"
+	case "self-signed":
+		return "\nsigned with a stable self-signed identity — permissions will survive upgrades"
+	default:
+		return "\n\nad-hoc signed: macOS pins the grant to this exact binary, so Screen" +
+			"\nRecording / Accessibility must be re-granted after every upgrade. Run" +
+			"\n`marble-peer install-autostart --trust-cert` from a Terminal window on" +
+			"\nthe Mac to create a stable identity."
+	}
+}
+
+// signBundle gives the app bundle the best stable signature it can, and reports
+// what it did.
 //
 // Why this matters: macOS TCC stores a code-signing requirement (csreq) that
 // pins a permission grant to the exact signing identity. With ad-hoc signing
@@ -134,42 +164,145 @@ func writeAppBundle(exe string) ([]string, error) {
 // user's Screen Recording / Accessibility grants and they must re-grant. That
 // is the single worst part of the macOS peer experience.
 //
-// Signing with a stable certificate fixes it permanently. Preference order:
-//  1. Developer ID Application certificate (best; also notarizable)
-//  2. a persistent self-signed certificate in the login keychain
-//  3. ad-hoc (grants must be re-granted after each upgrade)
-func signBundle(app string) {
-	if id := findSigningIdentity(); id != "" {
-		if exec.Command("codesign", "--force", "--deep", "--sign", id,
-			"--identifier", darwinBundleID, app).Run() == nil {
-			return
+// Two rules learned the hard way on macOS 27:
+//
+//  1. A bundle that already carries a valid, non-ad-hoc signature is left
+//     ALONE. Installing from a released .app.zip means the bundle is Developer
+//     ID signed, hardened-runtime flagged and timestamped; re-signing it throws
+//     all of that away, and for a Developer ID whose key cannot be used it
+//     silently downgrades the bundle to ad-hoc.
+//
+//  2. Codesign is confined to the user's DEFAULT keychain with --keychain, and
+//     the whole keychain list is never searched. Otherwise codesign walks the
+//     list, finds a Developer ID in a locked secondary keychain, and stops dead
+//     on a GUI "enter the keychain password" dialog the user has no way to
+//     answer. That dialog blocked a real install on macOS 27.
+//
+// A codesign call also carries a deadline, so a prompt can never hang an
+// install the way that one did.
+//
+// Preference order when signing is needed: Developer ID, then our persistent
+// self-signed certificate, then ad-hoc.
+func signBundle(app string) SigningOutcome {
+	clearSigningTemps(app)
+
+	if id, ok := existingStableSignature(app); ok {
+		return SigningOutcome{Action: "kept", Identity: id}
+	}
+
+	ID, keychain := usableSigningIdentity()
+	if ID != "" {
+		args := []string{"--force", "--deep", "--sign", ID, "--identifier", darwinBundleID}
+		if keychain != "" {
+			args = append(args, "--keychain", keychain)
+		}
+		args = append(args, app)
+		// Never wait on a dialog: codesign blocks forever if macOS decides to
+		// ask for a password.
+		if runTimeout(60*time.Second, "codesign", args...) == nil {
+			action := "developer-id"
+			if ID == darwinSelfSignedCN {
+				action = "self-signed"
+			}
+			return SigningOutcome{Action: action, Identity: ID}
 		}
 	}
-	// Ad-hoc fallback.
+
+	// Ad-hoc keeps the bundle launchable, and is the only option with no
+	// identity available. Report it rather than pretending it is stable.
 	_ = exec.Command("codesign", "--force", "--deep", "--sign", "-",
 		"--identifier", darwinBundleID, app).Run()
+	return SigningOutcome{Action: "adhoc"}
 }
 
-// findSigningIdentity returns a codesigning identity to use, preferring a
-// Developer ID and falling back to a self-signed cert we manage.
-func findSigningIdentity() string {
-	// Prefer a real Developer ID if the user has one.
-	out, err := exec.Command("security", "find-identity", "-v", "-p", "codesigning").Output()
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if strings.Contains(line, "Developer ID Application") {
-				if id := extractIdentityHash(line); id != "" {
-					return id
-				}
+// runTimeout runs a command with a deadline so a GUI password prompt cannot
+// hang an install forever.
+func runTimeout(d time.Duration, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Run()
+}
+
+// clearSigningTemps removes codesign scratch files left behind by an
+// interrupted signing run. A stale .cstemp inside the bundle is a resource the
+// seal does not account for, which makes `codesign --verify` fail with "a
+// sealed resource is missing or invalid" — so it must go before signing.
+func clearSigningTemps(app string) {
+	matches, err := filepath.Glob(filepath.Join(app, "Contents", "MacOS", "*.cstemp"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		_ = os.Remove(m)
+	}
+}
+
+// existingStableSignature reports the signing authority already on the bundle,
+// when that signature verifies and is not ad-hoc. Such a signature is stable
+// across upgrades, so re-signing it would only lose information.
+func existingStableSignature(app string) (string, bool) {
+	if exec.Command("codesign", "--verify", "--deep", "--strict", app).Run() != nil {
+		return "", false
+	}
+	// -dv writes its details to stderr.
+	out, err := exec.Command("codesign", "-dv", "--verbose=4", app).CombinedOutput()
+	if err != nil {
+		return "", false
+	}
+	authority := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "Signature=adhoc" {
+			return "", false
+		}
+		if authority == "" && strings.HasPrefix(line, "Authority=") {
+			authority = strings.TrimPrefix(line, "Authority=")
+		}
+	}
+	if authority == "" {
+		return "", false
+	}
+	return authority, true
+}
+
+// usableSigningIdentity returns an identity codesign can use, plus the keychain
+// holding it.
+//
+// ONLY the user's default keychain is ever considered. Searching the whole
+// keychain list is what produced the dialog that blocked a real install on
+// macOS 27: codesign walks the search list, finds a Developer ID in a secondary
+// signing keychain (first in the list, and locked), and stops dead asking for
+// THAT keychain's password — a password the user never set and has no way to
+// look up. Codesign is confined to the chosen keychain with --keychain so it
+// cannot wander back out.
+//
+// A locked default keychain may still prompt, but that is the user's login
+// keychain, whose password they know; a secondary keychain's is not.
+func usableSigningIdentity() (identity, keychain string) {
+	kc := loginKeychain()
+	if kc == "" {
+		return "", ""
+	}
+	out, err := exec.Command("security", "find-identity", "-v", "-p", "codesigning", kc).Output()
+	if err != nil {
+		return "", ""
+	}
+	lines := strings.Split(string(out), "\n")
+	// Developer ID first: it is stable across upgrades and notarizable.
+	for _, line := range lines {
+		if strings.Contains(line, "Developer ID Application") {
+			if id := extractIdentityHash(line); id != "" {
+				return id, kc
 			}
 		}
 	}
-	// Fall back to our own persistent self-signed certificate, if it is
-	// already trusted (see SelfSignedCertStatus for why trust matters).
-	if selfSignedCertUsable() {
-		return darwinSelfSignedCN
+	// Then the persistent self-signed certificate this tool creates.
+	for _, line := range lines {
+		if strings.Contains(line, darwinSelfSignedCN) {
+			return darwinSelfSignedCN, kc
+		}
 	}
-	return ""
+	return "", ""
 }
 
 // extractIdentityHash pulls the 40-hex-char SHA-1 from a `security
@@ -366,7 +499,7 @@ func installDarwin(exe string, enable bool) ([]string, string, error) {
 	}
 	_ = os.MkdirAll(filepath.Join(home(), "Library/Logs"), 0o755)
 
-	paths, err := writeAppBundle(exe)
+	paths, outcome, err := writeAppBundle(exe)
 	if err != nil {
 		return nil, "", err
 	}
@@ -436,18 +569,12 @@ func installDarwin(exe string, enable bool) ([]string, string, error) {
 		msg += "\nlogs: tail -f " + logPath
 		msg += "\n\nGrant Screen Recording + Accessibility to \"Marble Peer\" in"
 		msg += "\nSystem Settings → Privacy & Security, then run: marble-peer doctor"
-		if hasDeveloperID() {
-			msg += "\nsigned with your Developer ID — permissions will survive upgrades"
-		} else if usable, hint := SigningStatus(); !usable {
-			msg += "\n\nNOTE: " + hint
-			msg += "\nWithout a stable signing identity, macOS drops the permission"
-			msg += "\ngrants every time marble-peer is upgraded."
-		} else {
-			msg += "\nsigned with a stable self-signed identity — permissions will survive upgrades"
-		}
 	} else {
 		msg += "\nload with: launchctl bootstrap gui/$(id -u) " + plist
 	}
+	// Always report what happened to the code signature: it decides whether the
+	// user must re-grant Screen Recording / Accessibility after an upgrade.
+	msg += outcome.InstallMessage()
 	return paths, msg, nil
 }
 
@@ -490,7 +617,7 @@ func RelaunchViaLaunchServices(args []string) error {
 	if resolved, e := filepath.EvalSymlinks(exe); e == nil {
 		exe = resolved
 	}
-	if _, err := writeAppBundle(exe); err != nil {
+	if _, _, err := writeAppBundle(exe); err != nil {
 		return fmt.Errorf("write app bundle: %w", err)
 	}
 	// `open -g` keeps focus; -n forces a new instance even if one is running.
