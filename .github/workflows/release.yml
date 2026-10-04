@@ -96,6 +96,10 @@ jobs:
     name: Build macOS
     needs: version
     runs-on: macos-latest
+    # Carried into the release job so an unsigned run can say so out loud.
+    outputs:
+      signed: ${{ steps.cert.outputs.signed }}
+      identity: ${{ steps.cert.outputs.identity }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -111,28 +115,18 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # Never fails the job: on a bad or missing certificate it warns, explains why
+      # in the summary, and reports signed=false so the release still publishes.
+      # v0.2.0 was lost to a hard failure here ("MAC verification failed during
+      # PKCS12 import") when the tag was fine and only the secrets were wrong.
       - name: Import Developer ID
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
-            echo "no APPLE_CERTIFICATE; unsigned build"
-            exit 0
-          fi
-          CERT="$RUNNER_TEMP/cert.p12"
-          if ! printf '%s' "$APPLE_CERTIFICATE" | base64 -d > "$CERT" 2>/dev/null; then
-            printf '%s' "$APPLE_CERTIFICATE" > "$CERT"
-          fi
-          KW="$RUNNER_TEMP/build.keychain-db"
-          security create-keychain -p "ci" "$KW"
-          security set-keychain-settings -lut 21600 "$KW"
-          security unlock-keychain -p "ci" "$KW"
-          security import "$CERT" -k "$KW" -P "${APPLE_CERTIFICATE_PASSWORD:-}" \
-            -T /usr/bin/codesign -T /usr/bin/security
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "ci" "$KW"
-          security list-keychain -d user -s "$KW" login.keychain
+        id: cert
+        continue-on-error: true
+        uses: ./.github/actions/apple-sign-import
+        with:
+          certificate: ${{ secrets.APPLE_CERTIFICATE }}
+          password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          identity: ${{ secrets.APPLE_SIGNING_IDENTITY }}
 
       - name: Build
         env:
@@ -158,16 +152,13 @@ jobs:
           ls -la dist
 
       - name: Sign macOS binaries
+        if: steps.cert.outputs.signed == 'true'
         env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # The identity that actually landed in the keychain, not a hope.
+          SIGNING_IDENTITY: ${{ steps.cert.outputs.identity }}
         run: |
           set -euo pipefail
-          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
-            echo "no APPLE_CERTIFICATE; skipping codesign"
-            exit 0
-          fi
-          ID="${APPLE_SIGNING_IDENTITY:-Developer ID Application: Russell Endicott (F9ZLV9F2P3)}"
+          ID="${SIGNING_IDENTITY:?no signing identity was imported}"
           for f in dist/marble-peer-darwin-*; do
             echo "Signing $f…"
             codesign --force --options runtime --timestamp --sign "$ID" "$f"
@@ -177,8 +168,8 @@ jobs:
 
       - name: Package macOS app bundles
         env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SIGNED: ${{ steps.cert.outputs.signed }}
+          SIGNING_IDENTITY: ${{ steps.cert.outputs.identity }}
         run: |
           set -euo pipefail
           # Ship a .zip containing MarblePeer.app rather than a bare binary.
@@ -215,17 +206,22 @@ jobs:
               '</plist>' \
               > "$APP/Contents/Info.plist"
             plutil -lint "$APP/Contents/Info.plist"
-            if [ -n "${APPLE_CERTIFICATE:-}" ]; then
-              ID="${APPLE_SIGNING_IDENTITY:-Developer ID Application: Russell Endicott (F9ZLV9F2P3)}"
+            if [ "${SIGNED:-false}" = "true" ]; then
               codesign --force --deep --options runtime --timestamp \
-                --identifier com.rendicott.marble-peer --sign "$ID" "$APP"
+                --identifier com.rendicott.marble-peer --sign "$SIGNING_IDENTITY" "$APP"
               codesign --verify --deep --strict --verbose=2 "$APP"
+            else
+              # Still ship the bundle: it is what gives the peer its GUI identity,
+              # which is what makes screencapture work. It is just not signed.
+              echo "packaging $APP unsigned"
             fi
             ( cd dist && ditto -c -k --keepParent MarblePeer.app "marble-peer-darwin-${ARCH}.app.zip" )
           done
           ls -la dist
 
       - name: Notarize
+        # Notarization needs a signed bundle first.
+        if: steps.cert.outputs.signed == 'true'
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
@@ -328,6 +324,24 @@ jobs:
           )
           cat dist/SHA256SUMS
 
+      - name: Check macOS signing
+        env:
+          SIGNED: ${{ needs.build-darwin.outputs.signed }}
+          IDENTITY: ${{ needs.build-darwin.outputs.identity }}
+        run: |
+          set -euo pipefail
+          if [ "${SIGNED:-false}" = "true" ]; then
+            echo "macOS artifacts are Developer ID signed: ${IDENTITY}"
+            exit 0
+          fi
+          echo "::warning title=Unsigned macOS release::The macOS artifacts in this release are UNSIGNED (no certificate, or the import failed). Gatekeeper warns on first open and Screen Recording / Accessibility grants do not survive upgrades. See the Build macOS job summary."
+          {
+            echo "## ⚠️ Unsigned macOS artifacts"
+            echo
+            echo "This release publishes **unsigned** macOS artifacts: the Developer ID certificate was"
+            echo "missing or could not be imported. The **Build macOS → Import Developer ID** step says why."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -349,7 +363,9 @@ jobs:
             Pre-built **marble-peer** binaries built on **GitHub Actions** (`CGO_ENABLED=0`).
 
             macOS artifacts are **Developer ID signed** (and notarized when the App Store Connect
-            API key secrets are configured). Linux and Windows artifacts are unsigned.
+            API key secrets are configured) — when the signing certificate imports cleanly. If it
+            cannot be, the release still ships and the macOS artifacts are unsigned; the run
+            summary says which. Linux and Windows artifacts are unsigned.
 
             Linux targets compile on `ubuntu-latest`. macOS targets compile on `macos-latest` (not Linux cross-compile). Windows targets compile on `windows-latest`.
 

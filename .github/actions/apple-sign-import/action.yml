@@ -1,0 +1,47 @@
+# Import a Developer ID Application certificate into a throwaway keychain.
+#
+# This step never fails the job. Every failure path emits a ::warning, writes an
+# explanation to the job summary, and reports signed=false, so the release still
+# publishes an unsigned build instead of being lost.
+#
+# Causes it distinguishes:
+#   - APPLE_CERTIFICATE is not base64, or is not a DER/PKCS#12 file
+#   - APPLE_CERTIFICATE_PASSWORD does not open that .p12 (the v0.2.0 failure)
+#   - the p12 is an OpenSSL 3 AES-256/PBKDF2 export whose MAC the runner's
+#     `security` cannot verify -> re-encoded as 3DES/SHA-1 and retried
+#   - the .p12 holds no Developer ID private key, so no identity exists
+name: Import Apple signing certificate
+description: Decode and import a base64 Developer ID .p12 into a temporary keychain; never fails the job.
+
+inputs:
+  certificate:
+    description: base64 of the Developer ID Application .p12 (secrets.APPLE_CERTIFICATE)
+    required: false
+    default: ""
+  password:
+    description: password for that .p12 (secrets.APPLE_CERTIFICATE_PASSWORD)
+    required: false
+    default: ""
+  identity:
+    description: preferred signing identity; the identity found in the keychain is used when this is absent or does not match
+    required: false
+    default: ""
+
+outputs:
+  signed:
+    description: '"true" when a usable codesigning identity was imported'
+    value: ${{ steps.import.outputs.signed }}
+  identity:
+    description: the Developer ID identity to pass to codesign (empty when unsigned)
+    value: ${{ steps.import.outputs.identity }}
+
+runs:
+  using: composite
+  steps:
+    - id: import
+      shell: bash
+      env:
+        APPLE_CERTIFICATE: ${{ inputs.certificate }}
+        APPLE_CERTIFICATE_PASSWORD: ${{ inputs.password }}
+        APPLE_SIGNING_IDENTITY: ${{ inputs.identity }}
+      run: bash "${{ github.action_path }}/import-cert.sh"

@@ -1,0 +1,44 @@
+# Test the Apple signing secrets without cutting a tag.
+#
+# The release workflow only exercises the certificate when a v* tag is pushed, and
+# a broken certificate there costs a whole release (v0.2.0 was lost this way). Run
+# this by hand instead: it imports the same secrets on the same runner image and
+# fails loudly when they cannot yield a codesigning identity.
+name: Signing check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Validate Apple signing secrets
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Import Developer ID
+        id: cert
+        uses: ./.github/actions/apple-sign-import
+        with:
+          certificate: ${{ secrets.APPLE_CERTIFICATE }}
+          password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          identity: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+
+      - name: Result
+        env:
+          SIGNED: ${{ steps.cert.outputs.signed }}
+          IDENTITY: ${{ steps.cert.outputs.identity }}
+        run: |
+          set -euo pipefail
+          echo "signed=${SIGNED:-false}"
+          echo "identity=${IDENTITY:-}"
+          if [ "${SIGNED:-false}" != "true" ]; then
+            echo "::error title=Signing secrets unusable::APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD did not yield a Developer ID identity. Read the warnings and the job summary above, fix the secrets, then re-run the failed release jobs."
+            exit 1
+          fi
+          security find-identity -v -p codesigning
+          echo "macOS signing secrets are usable."
