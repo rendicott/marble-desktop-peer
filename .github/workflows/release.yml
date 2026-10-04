@@ -177,7 +177,7 @@ jobs:
           set -euo pipefail
           ID="${SIGNING_IDENTITY:?no signing identity was imported}"
           for f in dist/marble-peer-darwin-*; do
-            echo "Signing $f…"
+            echo "Signing ${f}"
             codesign --force --options runtime --timestamp --sign "$ID" "$f"
             codesign --verify --strict --verbose=2 "$f"
             codesign -dv "$f" 2>&1 | grep -E "Authority|TeamIdentifier" || true
@@ -254,7 +254,7 @@ jobs:
           printf '%s\n' "${APPLE_API_KEY_P8}" > "$KEY_PATH"
           chmod 600 "$KEY_PATH"
           for z in dist/marble-peer-darwin-*.app.zip; do
-            echo "Notarizing $z…"
+            echo "Notarizing ${z}"
             SUBMIT=$(xcrun notarytool submit "$z" \
               --key "$KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
               --wait --output-format json || true)
