@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.2.0] — 2026-10-03
+
 ### Pair with multiple harnesses; peer lock
 
 - A peer can be paired with several Marble harnesses (`marble-peer pair` per
