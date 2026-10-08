@@ -19,6 +19,9 @@ type Caps struct {
 	// Lock advertises protocol-v2 locking: actions are refused unless the
 	// sending harness holds the peer lock.
 	Lock bool `json:"lock"`
+	// Region advertises screenshot region capture: {region, space, scale, max_edge}
+	// on "screenshot", meta.region/zoom/downscaled, and desktop_click zoom=true.
+	Region bool `json:"region"`
 }
 
 type Envelope struct {

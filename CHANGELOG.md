@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+## [v0.2.2] — 2026-10-08
+
+### Region capture: zoom in on small panes at native resolution
+
+Every screenshot was downscaled to a 1280 px long edge. When the thing being driven
+is itself a small pane (a phone mirror, a VM console, a dense table), tap targets
+landed at ~5 px in the image the agent clicks on, and roughly one tap in six hit.
+The peer now advertises `caps.region`, and `screenshot` accepts:
+
+- `region: {x, y, w, h}`: capture just that area. By default the coordinates are
+  pixels of the **last screenshot**, the same space clicks use, so a caller can
+  outline what it sees; `space: "screen"` takes display coordinates instead.
+- `scale`: image px per display px. By default the crop keeps everything captured,
+  so on a Retina display a 400×500 region comes back at 800×1000.
+- `max_edge`: overrides the 1280 cap; `0` means uncapped (bounded at 4096).
+
+Clicks follow the view: after a region shot, click coordinates are pixels of the
+crop and the peer maps them back to the display. Post-click and post-type
+screenshots keep the current view, so a zoomed view stays zoomed and each
+post-action image confirms the hit at the same detail. A plain `screenshot` returns
+to the full screen. `desktop_click` also takes `zoom: true` to return a 400×400
+native crop centred on the click.
+
+Screenshot metadata now includes `region`, `zoom` (image px per display px) and
+`downscaled`. The last-click crosshair is tracked in display coordinates, so it
+lands correctly in crops.
+
+Cropping happens in software after capture, so Linux, macOS and Windows behave
+the same. With no options, `screenshot` is unchanged.
+
 ## [v0.2.1] — 2026-10-04
 
 ### macOS: installing over a signed bundle no longer asks for a keychain password

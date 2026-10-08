@@ -96,7 +96,43 @@ func (a *App) caps() protocol.Caps {
 		Confirm: true,
 		Exec:    true, // os/exec shells out on every platform — no extra probe needed
 		Lock:    true,
+		Region:  desk,
 	}
+}
+
+// clickZoomSize is the display-px square a desktop_click zoom=true verification crop covers.
+const clickZoomSize = 400
+
+// captureOpts parses screenshot payload {region:{x,y,w,h}, space, scale, max_edge}.
+// max_edge omitted = default cap; max_edge 0 = uncapped.
+func captureOpts(p map[string]interface{}) (desktop.CaptureOpts, error) {
+	var o desktop.CaptureOpts
+	if v, ok := p["scale"].(float64); ok && v > 0 {
+		o.Scale = v
+	}
+	if v, ok := p["max_edge"]; ok {
+		n, _ := asInt(v)
+		if n <= 0 {
+			o.MaxEdge = -1
+		} else {
+			o.MaxEdge = n
+		}
+	}
+	rm, ok := p["region"].(map[string]interface{})
+	if !ok || rm == nil {
+		return o, nil
+	}
+	x, _ := asInt(rm["x"])
+	y, _ := asInt(rm["y"])
+	w, _ := asInt(rm["w"])
+	h, _ := asInt(rm["h"])
+	space, _ := p["space"].(string)
+	r, err := desktop.ResolveRegion(desktop.Rect{X: x, Y: y, W: w, H: h}, space)
+	if err != nil {
+		return o, err
+	}
+	o.Region = &r
+	return o, nil
 }
 
 // Links returns the current harness links.
@@ -234,7 +270,11 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 	}
 	switch env.Kind {
 	case "screenshot":
-		img, meta, err := desktop.Screenshot(ctx)
+		opts, err := captureOpts(payload)
+		if err != nil {
+			return protocol.Envelope{OK: false, Error: err.Error()}
+		}
+		img, meta, err := desktop.ScreenshotWith(ctx, opts)
 		if err != nil {
 			return protocol.Envelope{OK: false, Error: err.Error()}
 		}
@@ -261,9 +301,19 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		if err := desktop.Click(ctx, x, y, btn); err != nil {
 			return protocol.Envelope{OK: false, Error: err.Error()}
 		}
+		sx, sy, _ := desktop.LastClickScreen()
 		// Atomic post-click screenshot in the same queue slot (avoids "peer busy").
-		img, meta, shotErr := desktop.Screenshot(ctx)
-		sx, sy := desktop.ImageToScreen(meta, x, y)
+		// It keeps the caller's current view (a zoomed region stays zoomed); zoom=true
+		// instead returns a native-detail crop centred on the click to verify the hit.
+		var img []byte
+		var meta desktop.ScreenMeta
+		var shotErr error
+		if zoom, _ := payload["zoom"].(bool); zoom {
+			r := desktop.ZoomAround(sx, sy, clickZoomSize)
+			img, meta, shotErr = desktop.ScreenshotWith(ctx, desktop.CaptureOpts{Region: &r})
+		} else {
+			img, meta, shotErr = desktop.ScreenshotSticky(ctx)
+		}
 		text := fmt.Sprintf("clicked image=(%d,%d) screen=(%d,%d) button=%s", x, y, sx, sy, btn)
 		envOut := protocol.Envelope{OK: true, Text: text}
 		if shotErr == nil {
@@ -294,7 +344,7 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		// it the harness has no "did my keystrokes land?" signal and (per field
 		// report peer-gui-loop-report, 2026-09-23) can retype the same text into
 		// an unfocused window indefinitely with no visible failure.
-		img, meta, shotErr := desktop.Screenshot(ctx)
+		img, meta, shotErr := desktop.ScreenshotSticky(ctx)
 		envOut := protocol.Envelope{OK: true}
 		if shotErr == nil {
 			ls := desktop.QueryLockState(ctx)
@@ -742,7 +792,7 @@ func (a *App) StatusJSON() map[string]interface{} {
 		"harnesses":        harnesses,
 		"lock":             a.LockInfo(),
 		"peer_version":     PeerVersion,
-		"caps":             protocol.Caps{Browser: browserOK, Desktop: desk, Confirm: true, Exec: true, Lock: true},
+		"caps":             protocol.Caps{Browser: browserOK, Desktop: desk, Confirm: true, Exec: true, Lock: true, Region: desk},
 		"desktop_note":     deskNote,
 		"desktop_ok":       desk,
 		"browser_ok":       browserOK,
@@ -892,6 +942,7 @@ func Pair(harnessURL, hCode string, allowHTTP bool) error {
 			"desktop": desk,
 			"confirm": true,
 			"exec":    true,
+			"region":  desk,
 		},
 	}
 	b, _ := json.Marshal(body)

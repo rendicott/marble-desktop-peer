@@ -27,13 +27,53 @@ import (
 // Clicks use image pixel space; peer maps to screen via ScreenW/ScreenH.
 const MaxScreenshotEdge = 1280
 
-// ScreenMeta describes the primary display capture (possibly downscaled for transport).
+// MaxScreenshotEdgeUncapped bounds max_edge=0 ("uncapped") so one request can't
+// produce a multi-hundred-MB frame on an 8K display.
+const MaxScreenshotEdgeUncapped = 4096
+
+// Rect is a rectangle in display (click-space) coordinates.
+type Rect struct {
+	X, Y, W, H int
+}
+
+// CaptureOpts selects what a screenshot returns (region capture, peer caps.region).
+type CaptureOpts struct {
+	// Region in display coordinates; nil = full screen.
+	Region *Rect
+	// Scale is image px per display px; 0 = all captured detail (physical pixels,
+	// e.g. 2× on Retina). Never upscales beyond what was captured.
+	Scale float64
+	// MaxEdge caps the longest image edge: 0 = default (MaxScreenshotEdge),
+	// <0 = uncapped (bounded by MaxScreenshotEdgeUncapped).
+	MaxEdge int
+}
+
+// ScreenMeta describes a capture (possibly a region, possibly downscaled for transport).
 type ScreenMeta struct {
 	W       int     `json:"w"`                  // JPEG / image width (model click space)
 	H       int     `json:"h"`                  // JPEG / image height
-	Scale   float64 `json:"scale"`              // screenW / imageW (1 if unscaled)
+	Scale   float64 `json:"scale"`              // display px per image px (region.w / w; 1 if unscaled)
 	ScreenW int     `json:"screen_w,omitempty"` // click-space width (physical or logical points)
 	ScreenH int     `json:"screen_h,omitempty"` // click-space height
+	// Region is the captured area in display coords; zero value = full screen.
+	Region Rect `json:"-"`
+	// Downscaled: the image has fewer pixels than the display area it shows.
+	Downscaled bool `json:"-"`
+}
+
+// region returns the captured area, treating the zero value as the full screen.
+func (m ScreenMeta) region() Rect {
+	if m.Region.W > 0 && m.Region.H > 0 {
+		return m.Region
+	}
+	sw, sh := m.ScreenW, m.ScreenH
+	if sw <= 0 {
+		sw = m.W
+	}
+	if sh <= 0 {
+		sh = m.H
+	}
+	return Rect{0, 0, sw, sh}
 }
 
 // Perms is a best-effort macOS TCC snapshot. Other OSes report n/a.
@@ -44,12 +84,13 @@ type Perms struct {
 }
 
 var (
-	screenMu     sync.Mutex
-	lastScreen   ScreenMeta
-	lastClickImg struct {
+	screenMu        sync.Mutex
+	lastScreen      ScreenMeta
+	stickyOpts      CaptureOpts // what post-action shots capture (last explicit request)
+	lastClickScreen struct {
 		X, Y int
 		Set  bool
-	} // image-space coords for overlay
+	} // display coords for the crosshair overlay (survives zoom changes)
 )
 
 // LastScreen returns dimensions from the most recent Screenshot (if any).
@@ -61,9 +102,17 @@ func LastScreen() ScreenMeta {
 
 // MetaMap returns JSON-friendly screenshot metadata for the protocol envelope.
 func MetaMap(meta ScreenMeta, extra map[string]interface{}) map[string]interface{} {
+	r := meta.region()
+	zoom := 0.0
+	if r.W > 0 {
+		zoom = float64(meta.W) / float64(r.W)
+	}
 	m := map[string]interface{}{
 		"w": meta.W, "h": meta.H, "scale": meta.Scale,
 		"screen_w": meta.ScreenW, "screen_h": meta.ScreenH,
+		"region":     map[string]int{"x": r.X, "y": r.Y, "w": r.W, "h": r.H},
+		"zoom":       zoom, // image px per display px
+		"downscaled": meta.Downscaled,
 	}
 	for k, v := range extra {
 		m[k] = v
@@ -71,28 +120,79 @@ func MetaMap(meta ScreenMeta, extra map[string]interface{}) map[string]interface
 	return m
 }
 
-// SetLastClickImage records the last click in image pixel space (for crosshair overlay).
-func SetLastClickImage(x, y int) {
+// setLastClickScreen records the last click in display coords (for crosshair overlay).
+func setLastClickScreen(x, y int) {
 	screenMu.Lock()
-	lastClickImg.X, lastClickImg.Y, lastClickImg.Set = x, y, true
+	lastClickScreen.X, lastClickScreen.Y, lastClickScreen.Set = x, y, true
 	screenMu.Unlock()
 }
 
-// ImageToScreen maps image-space click coords to physical/logical screen pixels.
+// LastClickScreen returns the last click in display coords.
+func LastClickScreen() (x, y int, ok bool) {
+	screenMu.Lock()
+	defer screenMu.Unlock()
+	return lastClickScreen.X, lastClickScreen.Y, lastClickScreen.Set
+}
+
+// ImageToScreen maps image-space click coords to physical/logical screen pixels,
+// through the captured region when the image is a crop.
 func ImageToScreen(meta ScreenMeta, ix, iy int) (sx, sy int) {
-	sw, sh := meta.ScreenW, meta.ScreenH
-	if sw <= 0 {
-		sw = meta.W
-	}
-	if sh <= 0 {
-		sh = meta.H
-	}
 	if meta.W <= 0 || meta.H <= 0 {
 		return ix, iy
 	}
-	sx = ix * sw / meta.W
-	sy = iy * sh / meta.H
-	return sx, sy
+	r := meta.region()
+	return r.X + ix*r.W/meta.W, r.Y + iy*r.H/meta.H
+}
+
+// ResolveRegion converts a requested region to display coords. space "image" means
+// pixels of the last screenshot (the same space clicks use); "screen" is display coords.
+func ResolveRegion(r Rect, space string) (Rect, error) {
+	if r.W <= 0 || r.H <= 0 {
+		return Rect{}, fmt.Errorf("region needs positive w and h (got %dx%d)", r.W, r.H)
+	}
+	switch strings.ToLower(strings.TrimSpace(space)) {
+	case "", "image":
+		meta := LastScreen()
+		if meta.W <= 0 || meta.H <= 0 {
+			return Rect{}, fmt.Errorf("region in image space needs a previous screenshot; take one first or pass space=screen")
+		}
+		x0, y0 := ImageToScreen(meta, r.X, r.Y)
+		x1, y1 := ImageToScreen(meta, r.X+r.W, r.Y+r.H)
+		return Rect{x0, y0, x1 - x0, y1 - y0}, nil
+	case "screen", "display":
+		return r, nil
+	default:
+		return Rect{}, fmt.Errorf("unknown region space %q (image|screen)", space)
+	}
+}
+
+// ZoomAround returns a size×size display-coord region centred on (x, y), shifted
+// to stay on screen.
+func ZoomAround(x, y, size int) Rect {
+	meta := LastScreen()
+	sw, sh := meta.ScreenW, meta.ScreenH
+	r := Rect{x - size/2, y - size/2, size, size}
+	if sw > 0 && sh > 0 {
+		if r.W > sw {
+			r.W = sw
+		}
+		if r.H > sh {
+			r.H = sh
+		}
+		if r.X+r.W > sw {
+			r.X = sw - r.W
+		}
+		if r.Y+r.H > sh {
+			r.Y = sh - r.H
+		}
+	}
+	if r.X < 0 {
+		r.X = 0
+	}
+	if r.Y < 0 {
+		r.Y = 0
+	}
+	return r
 }
 
 func enabled() bool {
@@ -103,8 +203,32 @@ func enabled() bool {
 	return true
 }
 
-// Screenshot captures the primary display as JPEG bytes.
+// Screenshot captures the full primary display as JPEG bytes (default size cap).
 func Screenshot(ctx context.Context) ([]byte, ScreenMeta, error) {
+	return ScreenshotWith(ctx, CaptureOpts{})
+}
+
+// ScreenshotWith captures per opts and makes them sticky for post-action shots.
+func ScreenshotWith(ctx context.Context, o CaptureOpts) ([]byte, ScreenMeta, error) {
+	img, meta, err := capture(ctx, o)
+	if err == nil {
+		screenMu.Lock()
+		stickyOpts = o
+		screenMu.Unlock()
+	}
+	return img, meta, err
+}
+
+// ScreenshotSticky repeats the last explicit capture request (region, scale, cap), so a
+// post-click shot of a zoomed region stays zoomed: verification at the same detail.
+func ScreenshotSticky(ctx context.Context) ([]byte, ScreenMeta, error) {
+	screenMu.Lock()
+	o := stickyOpts
+	screenMu.Unlock()
+	return capture(ctx, o)
+}
+
+func capture(ctx context.Context, o CaptureOpts) ([]byte, ScreenMeta, error) {
 	if !enabled() {
 		return nil, ScreenMeta{}, fmt.Errorf("desktop disabled (MARBLE_PEER_DESKTOP=0)")
 	}
@@ -118,17 +242,13 @@ func Screenshot(ctx context.Context) ([]byte, ScreenMeta, error) {
 	if err != nil {
 		return nil, ScreenMeta{}, err
 	}
-	return encodeShotMapped(out, coordW, coordH)
+	return encodeShotMapped(out, coordW, coordH, o)
 }
 
-func encodeShot(path string) ([]byte, ScreenMeta, error) {
-	return encodeShotMapped(path, 0, 0)
-}
-
-// encodeShotMapped JPEG-encodes path. If coordW/coordH > 0 they are the click
-// coordinate space (e.g. macOS logical points on a Retina display); otherwise
-// the decoded image pixel size is used (Linux).
-func encodeShotMapped(path string, coordW, coordH int) ([]byte, ScreenMeta, error) {
+// encodeShotMapped JPEG-encodes path, cropped and scaled per o. If coordW/coordH > 0
+// they are the click coordinate space (e.g. macOS logical points on a Retina display);
+// otherwise the decoded image pixel size is used (Linux).
+func encodeShotMapped(path string, coordW, coordH int, o CaptureOpts) ([]byte, ScreenMeta, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, ScreenMeta{}, err
@@ -150,16 +270,53 @@ func encodeShotMapped(path string, coordW, coordH int) ([]byte, ScreenMeta, erro
 		screenW, screenH = coordW, coordH
 	}
 
-	scaled := img
-	imgW, imgH := imgW0, imgH0
-	scale := float64(screenW) / float64(imgW)
-	if max(imgW, imgH) > MaxScreenshotEdge {
+	// Region in display coords, clamped to the screen.
+	reg := Rect{0, 0, screenW, screenH}
+	if o.Region != nil {
+		reg = clampRect(*o.Region, screenW, screenH)
+		if reg.W < 1 || reg.H < 1 {
+			return nil, ScreenMeta{}, fmt.Errorf("region %+v is outside the %dx%d display", *o.Region, screenW, screenH)
+		}
+	}
+	// Crop in captured (physical) pixels.
+	px0, py0 := reg.X*imgW0/screenW, reg.Y*imgH0/screenH
+	px1, py1 := (reg.X+reg.W)*imgW0/screenW, (reg.Y+reg.H)*imgH0/screenH
+	if px1 <= px0 {
+		px1 = px0 + 1
+	}
+	if py1 <= py0 {
+		py1 = py0 + 1
+	}
+	var src image.Image = img
+	if o.Region != nil {
+		src = cropImage(img, image.Rect(b.Min.X+px0, b.Min.Y+py0, b.Min.X+px1, b.Min.Y+py1))
+	}
+	cw, ch := px1-px0, py1-py0
+
+	imgW, imgH := cw, ch
+	if o.Scale > 0 {
+		tw := int(float64(reg.W)*o.Scale + 0.5)
+		th := int(float64(reg.H)*o.Scale + 0.5)
+		if tw >= 1 && th >= 1 && tw < cw {
+			imgW, imgH = tw, th
+		}
+	}
+	maxEdge := MaxScreenshotEdge
+	if o.MaxEdge > 0 {
+		maxEdge = o.MaxEdge
+	} else if o.MaxEdge < 0 {
+		maxEdge = MaxScreenshotEdgeUncapped
+	}
+	if maxEdge > MaxScreenshotEdgeUncapped {
+		maxEdge = MaxScreenshotEdgeUncapped
+	}
+	if max(imgW, imgH) > maxEdge {
 		if imgW >= imgH {
-			imgW = MaxScreenshotEdge
-			imgH = imgH0 * MaxScreenshotEdge / imgW0
+			imgH = imgH * maxEdge / imgW
+			imgW = maxEdge
 		} else {
-			imgH = MaxScreenshotEdge
-			imgW = imgW0 * MaxScreenshotEdge / imgH0
+			imgW = imgW * maxEdge / imgH
+			imgH = maxEdge
 		}
 		if imgW < 1 {
 			imgW = 1
@@ -167,21 +324,24 @@ func encodeShotMapped(path string, coordW, coordH int) ([]byte, ScreenMeta, erro
 		if imgH < 1 {
 			imgH = 1
 		}
-		scale = float64(screenW) / float64(imgW)
-		scaled = resizeNearest(img, imgW, imgH)
+	}
+	scaled := src
+	if imgW != cw || imgH != ch {
+		scaled = resizeNearest(src, imgW, imgH)
 	}
 
-	// Draw last-click crosshair in image space (helps vision see misses).
-	screenMu.Lock()
-	lcX, lcY, lcSet := lastClickImg.X, lastClickImg.Y, lastClickImg.Set
-	screenMu.Unlock()
-	if lcSet {
-		scaled = drawCrosshair(scaled, lcX, lcY)
+	// Draw last-click crosshair, mapped from display coords into this image.
+	if cx, cy, ok := LastClickScreen(); ok && cx >= reg.X && cy >= reg.Y && cx < reg.X+reg.W && cy < reg.Y+reg.H {
+		scaled = drawCrosshair(scaled, (cx-reg.X)*imgW/reg.W, (cy-reg.Y)*imgH/reg.H)
 	}
 
 	meta := ScreenMeta{
-		W: imgW, H: imgH, Scale: scale,
+		W: imgW, H: imgH, Scale: float64(reg.W) / float64(imgW),
 		ScreenW: screenW, ScreenH: screenH,
+		Downscaled: float64(imgW) < float64(reg.W)*0.99,
+	}
+	if o.Region != nil {
+		meta.Region = reg
 	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, scaled, &jpeg.Options{Quality: 80}); err != nil {
@@ -198,6 +358,29 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func clampRect(r Rect, sw, sh int) Rect {
+	x0, y0, x1, y1 := r.X, r.Y, r.X+r.W, r.Y+r.H
+	if x0 < 0 {
+		x0 = 0
+	}
+	if y0 < 0 {
+		y0 = 0
+	}
+	if x1 > sw {
+		x1 = sw
+	}
+	if y1 > sh {
+		y1 = sh
+	}
+	return Rect{x0, y0, x1 - x0, y1 - y0}
+}
+
+func cropImage(src image.Image, r image.Rectangle) image.Image {
+	dst := image.NewRGBA(image.Rect(0, 0, r.Dx(), r.Dy()))
+	draw.Draw(dst, dst.Bounds(), src, r.Min, draw.Src)
+	return dst
 }
 
 func resizeNearest(src image.Image, tw, th int) image.Image {
@@ -288,7 +471,7 @@ func Click(ctx context.Context, x, y int, button string) error {
 		}
 	}
 	sx, sy := ImageToScreen(meta, x, y)
-	SetLastClickImage(x, y)
+	setLastClickScreen(sx, sy)
 	return clickOS(ctx, sx, sy, button)
 }
 
