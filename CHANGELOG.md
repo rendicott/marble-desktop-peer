@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [v0.2.3] — 2026-10-09
+
+### Unattended enrollment with harness grants
+
+`marble-peer enroll` redeems a single-use grant minted in Marble (Settings → Computers →
+Create grant, harness v0.4.18+) with one request: no H-code, no P-code, no operator
+confirm. Built for disposable VMs and fleet provisioning.
+
+- The grant comes from `--grant`, `MARBLE_GRANT`, or `~/.marble-peer/grant` (bare secret,
+  or `{"harness": "...", "grant": "..."}`); the harness from `--harness`, the file, or
+  `MARBLE_HARNESS`.
+- `marble-peer run` enrolls from the environment or the grant file on start, so cloud-init
+  can drop a file and let autostart do the rest. A spent grant file is deleted.
+- Idempotent: a peer that already holds a token for that harness skips enrollment and leaves
+  the grant unspent (`--force` re-enrolls).
+- Retries an unreachable or booting harness for `--wait` (default 2m; `run` waits 5m);
+  definitive refusals (bad, used, expired grant) fail immediately.
+- Reports the machine's hostname (`--name` overrides) and peer version for the harness audit.
+
 ## [v0.2.2] — 2026-10-08
 
 ### Region capture: zoom in on small panes at native resolution

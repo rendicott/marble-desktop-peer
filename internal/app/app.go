@@ -918,12 +918,8 @@ func Pair(harnessURL, hCode string, allowHTTP bool) error {
 	if harnessURL == "" || hCode == "" {
 		return fmt.Errorf("harness_url and h_code required")
 	}
-	if strings.HasPrefix(harnessURL, "http://") && !allowHTTP {
-		// allow localhost always
-		if !strings.Contains(harnessURL, "127.0.0.1") && !strings.Contains(harnessURL, "localhost") &&
-			!strings.Contains(harnessURL, "100.") {
-			return fmt.Errorf("HTTP harness requires --allow-http or private mesh confirm")
-		}
+	if err := checkHarnessURL(harnessURL, allowHTTP); err != nil {
+		return err
 	}
 	if err := config.EnsureHome(); err != nil {
 		return err
@@ -932,18 +928,11 @@ func Pair(harnessURL, hCode string, allowHTTP bool) error {
 	if err := EnsureDeviceID(&cfg); err != nil {
 		return err
 	}
-	desk, _ := desktop.Available()
 	body := map[string]interface{}{
 		"h_code":    hCode,
 		"device_id": cfg.DeviceID,
 		"os":        runtime.GOOS,
-		"caps": map[string]bool{
-			"browser": findChrome() != "",
-			"desktop": desk,
-			"confirm": true,
-			"exec":    true,
-			"region":  desk,
-		},
+		"caps":      pairCaps(),
 	}
 	b, _ := json.Marshal(body)
 	resp, err := http.Post(harnessURL+"/api/computers/pair/join", "application/json", bytes.NewReader(b))
@@ -997,6 +986,30 @@ func Pair(harnessURL, hCode string, allowHTTP bool) error {
 		}
 	}
 	return fmt.Errorf("timeout waiting for operator confirm")
+}
+
+// checkHarnessURL refuses cleartext HTTP except loopback / tailnet unless allowed.
+func checkHarnessURL(harnessURL string, allowHTTP bool) error {
+	if strings.HasPrefix(harnessURL, "http://") && !allowHTTP {
+		// allow localhost always
+		if !strings.Contains(harnessURL, "127.0.0.1") && !strings.Contains(harnessURL, "localhost") &&
+			!strings.Contains(harnessURL, "100.") {
+			return fmt.Errorf("HTTP harness requires --allow-http or private mesh confirm")
+		}
+	}
+	return nil
+}
+
+// pairCaps is what the peer advertises when it joins or enrolls.
+func pairCaps() map[string]bool {
+	desk, _ := desktop.Available()
+	return map[string]bool{
+		"browser": findChrome() != "",
+		"desktop": desk,
+		"confirm": true,
+		"exec":    true,
+		"region":  desk,
+	}
 }
 
 func findChrome() string {

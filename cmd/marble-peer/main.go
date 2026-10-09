@@ -54,6 +54,33 @@ func main() {
 			fmt.Fprintln(os.Stderr, "pair:", err)
 			os.Exit(1)
 		}
+	case "enroll":
+		fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+		harness := fs.String("harness", "", "Marble harness base URL (or MARBLE_HARNESS)")
+		grant := fs.String("grant", "", "Grant secret (or MARBLE_GRANT, or ~/.marble-peer/grant)")
+		name := fs.String("name", "", "Device name to report (default: hostname)")
+		allowHTTP := fs.Bool("allow-http", false, "Allow cleartext HTTP harness URL (or MARBLE_ALLOW_HTTP=1)")
+		force := fs.Bool("force", false, "Enroll even if already enrolled with this harness")
+		wait := fs.Duration("wait", 2*time.Minute, "Keep retrying an unreachable harness this long")
+		_ = fs.Parse(args)
+		g, ok, err := app.ResolveGrant(*harness, *grant)
+		if err == nil && !ok {
+			err = fmt.Errorf("no grant: pass --grant, set MARBLE_GRANT, or write %s", app.GrantFilePath())
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "enroll:", err)
+			os.Exit(1)
+		}
+		res, err := app.Enroll(g, app.EnrollOpts{DeviceName: *name, AllowHTTP: *allowHTTP, Force: *force, Wait: *wait})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "enroll:", err)
+			os.Exit(1)
+		}
+		if res.Skipped {
+			fmt.Printf("already enrolled with %s as computer_id=%s (grant not used; --force to re-enroll)\n", res.Harness, res.ComputerID)
+		} else {
+			fmt.Printf("enrolled with %s as computer_id=%s\n", res.Harness, res.ComputerID)
+		}
 	case "status":
 		cfg, _ := config.Load()
 		toks, _ := config.LoadTokens()
@@ -170,6 +197,10 @@ func usage() {
 Commands:
   pair --harness URL --code H-XXXXXX [--allow-http]   # adds a harness; pair again for more
   pair --serve
+  enroll [--harness URL] [--grant SECRET] [--name N] [--force] [--wait 2m]
+                                  # redeem a harness grant; no codes, no confirm.
+                                  # grant/harness also from MARBLE_GRANT / MARBLE_HARNESS
+                                  # or ~/.marble-peer/grant (run enrolls from it on start)
   run [--kill-browser-on-exit] [--no-miniui] [--no-tray]
   status
   harnesses                       # list paired harnesses
@@ -223,9 +254,27 @@ func runDaemon(killBrowser, miniui, useTray bool, browserMode string, cdpPort in
 	}
 	_ = config.Save(cfg)
 
+	// A provisioned grant (MARBLE_GRANT / ~/.marble-peer/grant) enrolls on start, so
+	// cloud-init can drop a file and let autostart do the rest. Idempotent once enrolled.
+	if g, ok, gerr := app.ResolveGrant("", ""); gerr != nil {
+		log.Printf("grant: %v", gerr)
+	} else if ok {
+		res, eerr := app.Enroll(g, app.EnrollOpts{Wait: 5 * time.Minute})
+		switch {
+		case eerr != nil:
+			log.Printf("grant enroll (%s): %v", g.Source, eerr)
+		case !res.Skipped:
+			log.Printf("enrolled with %s as computer_id=%s via grant (%s)", res.Harness, res.ComputerID, g.Source)
+		}
+		if c, lerr := config.Load(); lerr == nil {
+			c.KillBrowser, c.BrowserMode, c.CDPPort = cfg.KillBrowser, cfg.BrowserMode, cfg.CDPPort
+			cfg = c
+		}
+	}
+
 	toks, err := config.LoadTokens()
 	if err != nil || len(cfg.Harnesses) == 0 || len(toks) == 0 {
-		log.Fatal("not paired — run: marble-peer pair --harness … --code …")
+		log.Fatal("not paired — run: marble-peer pair --harness … --code …  (or marble-peer enroll --grant …)")
 	}
 	if err := app.EnsureDeviceID(&cfg); err != nil {
 		log.Fatal(err)

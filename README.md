@@ -365,6 +365,29 @@ marble-peer run
 
 Mini UI (status / confirm): `http://127.0.0.1:18765` (or next free port; see `~/.marble-peer/state.json`).
 
+## Enroll (unattended, with a grant)
+
+For machines you provision (cloud-init / EC2 user-data, SSH, config management) there is no
+operator at the screen to swap codes. Instead the harness pre-authorizes the machine:
+
+1. In Marble: **Settings → Computers → Create grant** (or `POST /api/computers/grants`).
+   Copy the `mgrant_…` secret; it is shown once, single use, valid 24h by default.
+2. On the machine, any of:
+
+```bash
+marble-peer enroll --harness http://harness:8080 --grant mgrant_…
+MARBLE_HARNESS=http://harness:8080 MARBLE_GRANT=mgrant_… marble-peer enroll
+# or drop a file and let `marble-peer run` (autostart) enroll on start:
+echo '{"harness":"http://harness:8080","grant":"mgrant_…"}' > ~/.marble-peer/grant
+```
+
+3. `marble-peer run` (or `install-autostart`). The computer shows up in Settings → Computers.
+
+The machine's own hostname becomes its computer id (`--name` overrides). `enroll` is
+idempotent: if this peer already has a token for that harness it exits 0 and leaves the grant
+unspent. It retries an unreachable harness for `--wait` (default 2m). A spent grant file is
+deleted. Protocol details: Marble `docs/peer-protocol.md` → *Enrollment grants*.
+
 ## Autostart + system tray
 
 ### Windows
@@ -461,6 +484,7 @@ marble-peer run --gui             # relaunch through the bundle (SSH escape hatc
 | Command | Purpose |
 |---------|---------|
 | `marble-peer pair` | Complete mutual pairing with a harness H-code (run again to add more harnesses) |
+| `marble-peer enroll` | Redeem a single-use harness grant (`--grant`, `MARBLE_GRANT` or `~/.marble-peer/grant`): no codes, no confirm |
 | `marble-peer harnesses` | List paired harnesses |
 | `marble-peer run` | Long-running daemon (WS + actions + optional tray) |
 | `marble-peer run --gui` | macOS: relaunch through the app bundle to gain a GUI identity |
