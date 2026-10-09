@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [v0.2.5] — 2026-10-09
+
+### Windows session 0: read the screen from a DIB section
+
+v0.2.4's helper reached the logged-on session, then `GetDIBits` failed with
+`The operation completed successfully` (last-error 0) on the Microsoft Basic
+Display Adapter. When that happens, capture now blits into a DIB section and
+returns those bits. The helper also binds its thread to `winsta0\default` and,
+if it is still in session 0, reports that instead of `desktop: true`. A
+successful `GetDIBits` on a normal desktop is unchanged, and a user-level
+install still does not start the helper.
+
 ## [v0.2.4] — 2026-10-09
 
 ### Windows session 0: capture the logged-on desktop when the peer is SYSTEM

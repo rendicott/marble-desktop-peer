@@ -29,6 +29,11 @@ import (
 // run in a helper process of this same binary, created with the logged-on
 // user's token on winsta0\default. An interactive user session never reaches
 // this file's process-creation code.
+//
+// The helper binds its capture thread to that desktop before any GDI call.
+// lpDesktop names it for the process's initial thread; this repeats the bind
+// on the thread that actually calls BitBlt, and a helper that is still in
+// session 0 refuses the operation instead of reporting a capturable desktop.
 
 const (
 	createNoWindow                = 0x08000000
@@ -68,6 +73,30 @@ var (
 	procGetExitCodeProcess                = kernel32.NewProc("GetExitCodeProcess")
 	procTerminateProcess                  = kernel32.NewProc("TerminateProcess")
 	procWaitForSingleObject               = kernel32.NewProc("WaitForSingleObject")
+	procGetCurrentThreadId                = kernel32.NewProc("GetCurrentThreadId")
+
+	procGetThreadDesktop        = user32.NewProc("GetThreadDesktop")
+	procOpenWindowStationW      = user32.NewProc("OpenWindowStationW")
+	procSetProcessWindowStation = user32.NewProc("SetProcessWindowStation")
+	procCloseWindowStation      = user32.NewProc("CloseWindowStation")
+	procOpenDesktopW            = user32.NewProc("OpenDesktopW")
+	procSetThreadDesktop        = user32.NewProc("SetThreadDesktop")
+)
+
+// Window-station and desktop rights the helper needs to select winsta0\default
+// and then BitBlt it. WINSTA_ALL_ACCESS is 0x37F; the desktop rights through
+// DESKTOP_SWITCHDESKTOP are 0x01FF.
+const (
+	winstaAllAccess  = 0x37F
+	desktopAllAccess = 0x01FF
+	uoiNameInfo      = 2
+)
+
+// Held for the worker's lifetime. Closing the window station or desktop that
+// the process is bound to drops the connection.
+var (
+	workerWinSta syscall.Handle
+	workerDesk   syscall.Handle
 )
 
 // startupInfoEx is STARTUPINFOEXW. syscall.StartupInfo matches STARTUPINFOW;
@@ -484,7 +513,7 @@ func (b *sessionBridge) startLocked(target attachSession, token syscall.Token) e
 	b.dec = json.NewDecoder(b.stdout)
 	b.session = target
 	go drainWorkerStderr(b.stderr)
-	log.Printf("desktop: %s", attachOKNote(target.ID, target.User))
+	log.Printf("desktop: helper started in session %d (%s) on winsta0\\default", target.ID, target.User)
 	return nil
 }
 
@@ -700,6 +729,132 @@ func session0Err(ctx context.Context, req workerReq) error {
 	return nil
 }
 
+// bindWorkerDesktop puts this thread on winsta0\default when it is not already
+// there. A helper created with lpDesktop is normally already there; a thread
+// that came up on WinDisc (session 0, or a disconnected station) is moved.
+// Failure is logged and, when the process is still in session 0, every
+// operation is refused by dispatchWorker.
+func bindWorkerDesktop() error {
+	if workerOnUserDesktop() {
+		return nil
+	}
+	st := windowStationName()
+	dk := threadDesktopName()
+	wrongName := (st != "" && !strings.EqualFold(st, "WinSta0")) || (dk != "" && !strings.EqualFold(dk, "Default"))
+	if !wrongName && !workerInSession0() {
+		// Station name could not be read and this is not session 0. Leave the
+		// thread where CreateProcessAsUser put it rather than guessing.
+		return nil
+	}
+	if err := switchToInteractiveDesktop(); err != nil {
+		return err
+	}
+	if workerInSession0() {
+		return fmt.Errorf("still in session 0 (%s)", capturePlace())
+	}
+	return nil
+}
+
+func switchToInteractiveDesktop() error {
+	stationName, err := syscall.UTF16PtrFromString("winsta0")
+	if err != nil {
+		return err
+	}
+	hWin, _, e := procOpenWindowStationW.Call(uintptr(unsafe.Pointer(stationName)), 0, winstaAllAccess)
+	runtime.KeepAlive(stationName)
+	if hWin == 0 {
+		return fmt.Errorf("OpenWindowStation(winsta0): %v", callErr(e))
+	}
+	if r, _, e := procSetProcessWindowStation.Call(hWin); r == 0 {
+		procCloseWindowStation.Call(hWin)
+		return fmt.Errorf("SetProcessWindowStation: %v", callErr(e))
+	}
+	workerWinSta = syscall.Handle(hWin)
+
+	deskName, err := syscall.UTF16PtrFromString("default")
+	if err != nil {
+		return err
+	}
+	hDesk, _, e := procOpenDesktopW.Call(uintptr(unsafe.Pointer(deskName)), 0, 0, desktopAllAccess)
+	runtime.KeepAlive(deskName)
+	if hDesk == 0 {
+		return fmt.Errorf("OpenDesktop(default): %v", callErr(e))
+	}
+	if r, _, e := procSetThreadDesktop.Call(hDesk); r == 0 {
+		procCloseDesktop.Call(hDesk)
+		return fmt.Errorf("SetThreadDesktop: %v", callErr(e))
+	}
+	workerDesk = syscall.Handle(hDesk)
+	return nil
+}
+
+func workerOnUserDesktop() bool {
+	sid, known := currentSessionID()
+	if !known || sid == 0 {
+		return false
+	}
+	return strings.EqualFold(windowStationName(), "WinSta0") && strings.EqualFold(threadDesktopName(), "Default")
+}
+
+func workerInSession0() bool {
+	sid, known := currentSessionID()
+	return known && sid == 0
+}
+
+func currentSessionID() (uint32, bool) {
+	pid, _, _ := procGetCurrentProcessId.Call()
+	var sid uint32
+	r, _, _ := procProcessIdToSessionId.Call(pid, uintptr(unsafe.Pointer(&sid)))
+	if r == 0 {
+		return 0, false
+	}
+	return sid, true
+}
+
+func capturePlace() string {
+	sess := "session ?"
+	if sid, ok := currentSessionID(); ok {
+		sess = fmt.Sprintf("session %d", sid)
+	}
+	return fmt.Sprintf("%s, window station %s, desktop %s",
+		sess, orUnknown(windowStationName()), orUnknown(threadDesktopName()))
+}
+
+func windowStationName() string {
+	h, _, _ := procGetProcessWindowStation.Call()
+	if h == 0 {
+		return ""
+	}
+	return userObjectName(h)
+}
+
+func threadDesktopName() string {
+	tid, _, _ := procGetCurrentThreadId.Call()
+	h, _, _ := procGetThreadDesktop.Call(tid)
+	if h == 0 {
+		return ""
+	}
+	return userObjectName(h)
+}
+
+func userObjectName(h uintptr) string {
+	var name [128]uint16
+	var need uint32
+	r, _, _ := procGetUserObjectInformationW.Call(h, uoiNameInfo,
+		uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)*2), uintptr(unsafe.Pointer(&need)))
+	if r == 0 {
+		return ""
+	}
+	return syscall.UTF16ToString(name[:])
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "?"
+	}
+	return s
+}
+
 // RunSessionWorker serves desktop operations on stdin/stdout. The parent starts
 // it inside the interactive session; it must call the local GDI path, never
 // the session-0 router.
@@ -707,6 +862,11 @@ func RunSessionWorker() error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	log.SetOutput(os.Stderr)
+	if err := bindWorkerDesktop(); err != nil {
+		log.Printf("desktop worker: bind winsta0\\default: %v (%s)", err, capturePlace())
+	} else {
+		log.Printf("desktop worker: %s", capturePlace())
+	}
 	dec := json.NewDecoder(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)
 	for {
@@ -726,6 +886,11 @@ func RunSessionWorker() error {
 }
 
 func dispatchWorker(req workerReq) workerResp {
+	if workerInSession0() {
+		return workerResp{OK: false, Error: fmt.Sprintf(
+			"desktop worker is still in session 0 (window station %s, desktop %s); capture has to run on the logged-on session's winsta0\\default",
+			orUnknown(windowStationName()), orUnknown(threadDesktopName()))}
+	}
 	switch req.Op {
 	case "shot":
 		return workerShot()

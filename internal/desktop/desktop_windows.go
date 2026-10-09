@@ -4,6 +4,7 @@ package desktop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
@@ -46,6 +47,7 @@ var (
 
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
 	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
+	procCreateDIBSection       = gdi32.NewProc("CreateDIBSection")
 	procSelectObject           = gdi32.NewProc("SelectObject")
 	procBitBlt                 = gdi32.NewProc("BitBlt")
 	procGetDIBits              = gdi32.NewProc("GetDIBits")
@@ -182,14 +184,39 @@ func screenshotHere(ctx context.Context, out string) (coordW, coordH int, err er
 	return w, h, nil
 }
 
+// errGetDIBits is wrapped by the compatible-bitmap path when GetDIBits copies
+// zero scan lines. captureScreen falls back to a DIB section only then, so a
+// BitBlt failure (locked or secure desktop) stays the error it was before.
+var errGetDIBits = errors.New("GetDIBits failed")
+
 // captureScreen copies the primary display into an RGBA image via GDI.
+// The compatible-bitmap path is unchanged when it succeeds. On the Microsoft
+// Basic Display Adapter, BitBlt succeeds and GetDIBits returns 0 with
+// GetLastError 0 ("The operation completed successfully"); a DIB section
+// is the bits, so that failure is retried through CreateDIBSection.
 func captureScreen(w, h int) (*image.RGBA, error) {
-	screen, _, _ := procGetDC.Call(0)
+	screen, _, e := procGetDC.Call(0)
 	if screen == 0 {
-		return nil, fmt.Errorf("screenshot: GetDC(NULL) failed")
+		return nil, fmt.Errorf("screenshot: GetDC(NULL) failed: %v", callErr(e))
 	}
 	defer procReleaseDC.Call(0, screen)
 
+	img, err := captureCompatible(screen, w, h)
+	if err == nil {
+		return img, nil
+	}
+	if !errors.Is(err, errGetDIBits) {
+		return nil, err
+	}
+	img, dibErr := captureDIB(screen, w, h)
+	if dibErr == nil {
+		return img, nil
+	}
+	return nil, fmt.Errorf("%s; DIB section: %v (%s)", err.Error(), dibErr, capturePlace())
+}
+
+// captureCompatible is the original CreateCompatibleBitmap + GetDIBits path.
+func captureCompatible(screen uintptr, w, h int) (*image.RGBA, error) {
 	mem, _, _ := procCreateCompatibleDC.Call(screen)
 	if mem == 0 {
 		return nil, fmt.Errorf("screenshot: CreateCompatibleDC failed")
@@ -210,25 +237,155 @@ func captureScreen(w, h int) (*image.RGBA, error) {
 		return nil, fmt.Errorf("screenshot: BitBlt failed: %v (locked screen, disconnected remote session, or secure desktop?)", e)
 	}
 
+	pix, gerr := readDIBits(screen, bmp, w, h, -int32(h), false)
+	if gerr != nil {
+		// Some display drivers reject a top-down DIB and leave the last
+		// error at 0. A bottom-up read is the same pixels, flipped.
+		var gerr2 error
+		pix, gerr2 = readDIBits(screen, bmp, w, h, int32(h), true)
+		if gerr2 == nil {
+			flipRows(pix, w, h)
+			gerr = nil
+		}
+	}
+	if gerr != nil {
+		return nil, fmt.Errorf("screenshot: %w: %v", errGetDIBits, gerr)
+	}
+	bgraToRGBA(pix)
+	return &image.RGBA{Pix: pix, Stride: w * 4, Rect: image.Rect(0, 0, w, h)}, nil
+}
+
+// captureDIB blits into a device-independent section so the pixels are the
+// buffer itself. Used when GetDIBits cannot convert a compatible bitmap.
+func captureDIB(screen uintptr, w, h int) (*image.RGBA, error) {
+	img, err := captureDIBHeight(screen, w, h, -int32(h))
+	if err == nil {
+		return img, nil
+	}
+	img, err2 := captureDIBHeight(screen, w, h, int32(h))
+	if err2 != nil {
+		return nil, err
+	}
+	flipRows(img.Pix, w, h)
+	return img, nil
+}
+
+func captureDIBHeight(screen uintptr, w, h int, height int32) (*image.RGBA, error) {
+	bi := bitmapInfo{Header: bitmapInfoHeader{
+		Size:        uint32(unsafe.Sizeof(bitmapInfoHeader{})),
+		Width:       int32(w),
+		Height:      height,
+		Planes:      1,
+		BitCount:    32,
+		Compression: biRGB,
+		SizeImage:   uint32(w * h * 4),
+	}}
+	var bits unsafe.Pointer
+	bmp, _, e := procCreateDIBSection.Call(screen, uintptr(unsafe.Pointer(&bi)),
+		0, uintptr(unsafe.Pointer(&bits)), 0, 0)
+	if bmp == 0 || bits == nil {
+		return nil, fmt.Errorf("CreateDIBSection: %v", callErr(e))
+	}
+	defer procDeleteObject.Call(bmp)
+
+	mem, _, _ := procCreateCompatibleDC.Call(screen)
+	if mem == 0 {
+		return nil, fmt.Errorf("CreateCompatibleDC failed")
+	}
+	defer procDeleteDC.Call(mem)
+
+	old, _, _ := procSelectObject.Call(mem, bmp)
+	if err := blitScreen(mem, screen, w, h); err != nil {
+		if old != 0 {
+			_, _, _ = procSelectObject.Call(mem, old)
+		}
+		return nil, err
+	}
+	n := w * h * 4
+	pix := make([]byte, n)
+	copy(pix, unsafe.Slice((*byte)(bits), n))
+	if old != 0 {
+		_, _, _ = procSelectObject.Call(mem, old)
+	}
+	bgraToRGBA(pix)
+	return &image.RGBA{Pix: pix, Stride: w * 4, Rect: image.Rect(0, 0, w, h)}, nil
+}
+
+// blitScreen copies the screen DC. CAPTUREBLT includes layered windows; the
+// basic display driver sometimes rejects that flag, so a plain SRCCOPY is
+// the second try.
+func blitScreen(dst, screen uintptr, w, h int) error {
+	r, _, e := procBitBlt.Call(dst, 0, 0, uintptr(w), uintptr(h), screen, 0, 0, srcCopy|captureBlt)
+	if r != 0 {
+		return nil
+	}
+	first := e
+	r, _, e = procBitBlt.Call(dst, 0, 0, uintptr(w), uintptr(h), screen, 0, 0, srcCopy)
+	if r != 0 {
+		return nil
+	}
+	if first == nil || first == syscall.Errno(0) {
+		first = e
+	}
+	return fmt.Errorf("BitBlt failed: %v (locked screen, disconnected remote session, or secure desktop?)", first)
+}
+
+// readDIBits copies a BGRA image out of a compatible bitmap. height's sign
+// selects top-down (negative) or bottom-up. sizeImage is set only for the
+// bottom-up retry; the first call stays the historical zero size.
+func readDIBits(hdc, bmp uintptr, w, h int, height int32, sizeImage bool) ([]byte, error) {
 	pix := make([]byte, w*h*4)
 	bi := bitmapInfo{Header: bitmapInfoHeader{
 		Size:        uint32(unsafe.Sizeof(bitmapInfoHeader{})),
 		Width:       int32(w),
-		Height:      -int32(h), // negative = top-down rows
+		Height:      height,
 		Planes:      1,
 		BitCount:    32,
 		Compression: biRGB,
 	}}
-	r, _, e = procGetDIBits.Call(screen, bmp, 0, uintptr(h),
+	if sizeImage {
+		bi.Header.SizeImage = uint32(w * h * 4)
+	}
+	r, _, e := procGetDIBits.Call(hdc, bmp, 0, uintptr(h),
 		uintptr(unsafe.Pointer(&pix[0])), uintptr(unsafe.Pointer(&bi)), 0 /* DIB_RGB_COLORS */)
 	if r == 0 {
-		return nil, fmt.Errorf("screenshot: GetDIBits failed: %v", e)
+		if e == nil {
+			e = syscall.Errno(0)
+		}
+		return nil, e
 	}
-	for i := 0; i+3 < len(pix); i += 4 { // BGRA -> RGBA, force opaque
+	return pix, nil
+}
+
+func bgraToRGBA(pix []byte) {
+	for i := 0; i+3 < len(pix); i += 4 {
 		pix[i], pix[i+2] = pix[i+2], pix[i]
 		pix[i+3] = 0xFF
 	}
-	return &image.RGBA{Pix: pix, Stride: w * 4, Rect: image.Rect(0, 0, w, h)}, nil
+}
+
+func flipRows(pix []byte, w, h int) {
+	stride := w * 4
+	if stride <= 0 || len(pix) < stride*h {
+		return
+	}
+	row := make([]byte, stride)
+	for y := 0; y < h/2; y++ {
+		a := y * stride
+		b := (h - 1 - y) * stride
+		copy(row, pix[a:a+stride])
+		copy(pix[a:a+stride], pix[b:b+stride])
+		copy(pix[b:b+stride], row)
+	}
+}
+
+// callErr turns the Errno(0) that proc.Call reports on success into a real
+// error when the primary return already said the call failed.
+func callErr(e error) error {
+	if e == nil || e == syscall.Errno(0) {
+		return syscall.EINVAL
+	}
+	return e
 }
 
 func sendMouse(flags uint32, data int32) error {
