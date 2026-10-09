@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [v0.2.6] — 2026-10-09
+
+### Action queue: a stuck command no longer wedges the peer
+
+A shell child that outlived its parent (`security` waiting on a keychain
+prompt, `osascript` in an accessibility walk) kept the stdout pipe open, so
+the action never returned. The peer stayed `Online` with `busy: true` and
+every later `computer_*` call failed with `peer busy` until the process was
+restarted. Commands now kill their process group when the deadline or
+`/stop` fires, and if a handler still has not returned a few seconds after
+cancel, the queue slot is released anyway. Each action logs a start line and
+an end line.
+
 ## [v0.2.5] — 2026-10-09
 
 ### Windows session 0: read the screen from a DIB section

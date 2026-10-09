@@ -19,6 +19,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/rendicott/marble-desktop-peer/internal/cmdx"
 )
 
 // MaxOutputBytes caps stdout and stderr independently — keeps the websocket
@@ -65,7 +67,9 @@ func Run(ctx context.Context, command, cwd string, timeoutSec int) (Result, erro
 	defer cancel()
 
 	name, args, shell := shellCommand(command)
-	cmd := exec.CommandContext(cctx, name, args...)
+	// cmdx kills the shell's children too. Otherwise `security` or `osascript`
+	// keeps the stdout pipe open after bash dies and Wait never returns.
+	cmd := cmdx.Command(cctx, name, args...)
 	if cwd != "" {
 		cmd.Dir = cwd
 	}

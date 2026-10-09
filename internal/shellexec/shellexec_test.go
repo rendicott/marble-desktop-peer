@@ -2,8 +2,10 @@ package shellexec
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunEcho(t *testing.T) {
@@ -42,5 +44,24 @@ func TestRunTimeout(t *testing.T) {
 	}
 	if !res.TimedOut {
 		t.Fatalf("Result.TimedOut = false, want true (err=%v)", err)
+	}
+}
+
+// A background child of the shell inherits the stdout pipe. Killing only the
+// shell used to leave Cmd.Wait blocked until that child exited, which pinned
+// the peer's one action slot. The command must come back when its own timeout
+// fires, not when the grandchild's sleep ends.
+func TestRunTimeoutKillsShellGrandchild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("powershell does not leave a unix-style background child")
+	}
+	start := time.Now()
+	res, err := Run(context.Background(), "sleep 30 & wait", "", 1)
+	elapsed := time.Since(start)
+	if elapsed > 8*time.Second {
+		t.Fatalf("took %s; grandchild kept Wait blocked", elapsed)
+	}
+	if err == nil || !res.TimedOut {
+		t.Fatalf("err=%v timed_out=%v elapsed=%s", err, res.TimedOut, elapsed)
 	}
 }

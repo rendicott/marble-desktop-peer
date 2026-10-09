@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/rendicott/marble-desktop-peer/internal/cmdx"
 )
 
 // LockState reports whether the session appears locked / on greeter.
@@ -31,7 +33,7 @@ func QueryLockState(ctx context.Context) LockState {
 		{"org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver.GetActive"},
 		{"org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver.GetActive"},
 	} {
-		cmd := exec.CommandContext(ctx, "gdbus", "call", "--session",
+		cmd := cmdx.Command(ctx, "gdbus", "call", "--session",
 			"--dest", dest.dest,
 			"--object-path", dest.path,
 			"--method", dest.method,
@@ -51,7 +53,7 @@ func QueryLockState(ctx context.Context) LockState {
 	}
 	// loginctl show-session
 	if path, err := exec.LookPath("loginctl"); err == nil {
-		cmd := exec.CommandContext(ctx, path, "show-session", "self", "-p", "LockedHint", "--value")
+		cmd := cmdx.Command(ctx, path, "show-session", "self", "-p", "LockedHint", "--value")
 		ensureDisplay(cmd)
 		out, err := cmd.CombinedOutput()
 		if err == nil {
@@ -68,7 +70,7 @@ func QueryLockState(ctx context.Context) LockState {
 }
 
 func queryLockDarwin(ctx context.Context) LockState {
-	cmd := exec.CommandContext(ctx, "ioreg", "-n", "Root", "-d1")
+	cmd := cmdx.Command(ctx, "ioreg", "-n", "Root", "-d1")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		s := string(out)

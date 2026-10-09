@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -331,6 +332,9 @@ func (l *link) handleAction(env protocol.Envelope) {
 	parent, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
 
+	summary := actionSummary(env)
+	log.Printf("action start id=%s %s", env.ID, summary)
+	started := time.Now()
 	err := l.a.Q.Run(parent, func(ctx context.Context) error {
 		res := l.a.exec(ctx, env)
 		res.Type = "result"
@@ -340,10 +344,35 @@ func (l *link) handleAction(env protocol.Envelope) {
 		}
 		return nil
 	})
+	log.Printf("action end id=%s %s dur=%s err=%v", env.ID, env.Kind, time.Since(started).Round(time.Millisecond), err)
 	if err != nil {
 		// Queue rejected (busy/cancel) or write failed — still try to surface error once.
 		_ = l.write(protocol.Envelope{
 			Type: "result", ID: env.ID, OK: false, Error: err.Error(),
 		})
 	}
+}
+
+// actionSummary is the start-log text. computer_exec includes a short prefix
+// of the command so a wedge can be tied to security/osascript/curl; the rest
+// of the command and all output stay out of the log.
+func actionSummary(env protocol.Envelope) string {
+	if env.Kind != "computer_exec" {
+		if env.Kind == "" {
+			return "action"
+		}
+		return env.Kind
+	}
+	var payload map[string]interface{}
+	_ = json.Unmarshal(env.Payload, &payload)
+	cmd, _ := payload["command"].(string)
+	cmd = strings.Join(strings.Fields(cmd), " ")
+	const max = 80
+	if len(cmd) > max {
+		cmd = cmd[:max] + "…"
+	}
+	if cmd == "" {
+		return "computer_exec"
+	}
+	return "computer_exec " + cmd
 }

@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/rendicott/marble-desktop-peer/internal/cmdx"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,7 +49,7 @@ func ensureDeskHelper(ctx context.Context) (string, error) {
 		return "", err
 	}
 	bin := filepath.Join(dir, "marble-desk")
-	if out, err := exec.CommandContext(ctx, bin, "version").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) == deskHelperVersion {
+	if out, err := cmdx.Command(ctx, bin, "version").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) == deskHelperVersion {
 		helperPath = bin
 		helperErr = nil
 		return bin, nil
@@ -62,13 +64,13 @@ func ensureDeskHelper(ctx context.Context) (string, error) {
 		helperErr = fmt.Errorf("swiftc not found (install Xcode Command Line Tools) and no cached marble-desk helper")
 		return "", helperErr
 	}
-	cmd := exec.CommandContext(ctx, swiftc, "-O", "-o", bin, src)
+	cmd := cmdx.Command(ctx, swiftc, "-O", "-o", bin, src)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		helperErr = fmt.Errorf("swiftc marble-desk: %v: %s", err, strings.TrimSpace(string(out)))
 		return "", helperErr
 	}
 	_ = exec.Command("codesign", "-s", "-", "-f", bin).Run()
-	if out, err := exec.CommandContext(ctx, bin, "version").CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != deskHelperVersion {
+	if out, err := cmdx.Command(ctx, bin, "version").CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != deskHelperVersion {
 		helperErr = fmt.Errorf("marble-desk helper failed after compile: %v %s", err, strings.TrimSpace(string(out)))
 		return "", helperErr
 	}
@@ -82,7 +84,7 @@ func runDesk(ctx context.Context, args ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := cmdx.Command(ctx, bin, args...)
 	out, err := cmd.CombinedOutput()
 	s := strings.TrimSpace(string(out))
 	if err != nil {
@@ -106,7 +108,7 @@ func (s darwinScreenSize) points() (w, h int) {
 func darwinScreensize(ctx context.Context) (darwinScreenSize, error) {
 	var sz darwinScreenSize
 	// JXA first — no helper compile, TCC follows the parent process.
-	cmd := exec.CommandContext(ctx, "osascript", "-l", "JavaScript", "-e",
+	cmd := cmdx.Command(ctx, "osascript", "-l", "JavaScript", "-e",
 		`ObjC.import("AppKit"); var s=$.NSScreen.mainScreen; JSON.stringify({w:s.frame.size.width,h:s.frame.size.height,scale:s.backingScaleFactor,px_w:s.frame.size.width*s.backingScaleFactor,px_h:s.frame.size.height*s.backingScaleFactor});`)
 	if out, err := cmd.CombinedOutput(); err == nil {
 		if json.Unmarshal(bytes.TrimSpace(out), &sz) == nil && sz.W > 0 && sz.H > 0 {
@@ -130,7 +132,7 @@ func screenshotOS(ctx context.Context, out string) (coordW, coordH int, err erro
 		sc = "/usr/sbin/screencapture"
 	}
 	try := func() error {
-		cmd := exec.CommandContext(ctx, sc, "-x", "-m", "-t", "png", out)
+		cmd := cmdx.Command(ctx, sc, "-x", "-m", "-t", "png", out)
 		b, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("screencapture: %v: %s", err, strings.TrimSpace(string(b)))
@@ -198,7 +200,7 @@ func clickOS(ctx context.Context, sx, sy int, button string) error {
 		if button == "3" {
 			spec = fmt.Sprintf("rc:%d,%d", sx, sy)
 		}
-		cmd := exec.CommandContext(ctx, cliclick, spec)
+		cmd := cmdx.Command(ctx, cliclick, spec)
 		if out, err2 := cmd.CombinedOutput(); err2 == nil {
 			logFrontmost(ctx)
 			return nil
@@ -233,7 +235,7 @@ if (!up) throw new Error("CGEventCreateMouseEvent up failed");
 $.CGEventPost(0, up);
 "ok";
 `, x, y, down, btn, up, btn)
-	cmd := exec.CommandContext(ctx, "osascript", "-l", "JavaScript", "-e", script)
+	cmd := cmdx.Command(ctx, "osascript", "-l", "JavaScript", "-e", script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
@@ -262,7 +264,7 @@ func activeWindowOS(ctx context.Context) (title, app string, err error) {
 	end try
 	return appName & "|" & winTitle
 end tell`
-	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
+	cmd := cmdx.Command(ctx, "osascript", "-e", script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", "", fmt.Errorf("osascript frontmost: %v: %s", err, strings.TrimSpace(string(out)))
@@ -282,7 +284,7 @@ func typeOS(ctx context.Context, text string) error {
 	} else {
 		// osascript System Events fallback (also needs Accessibility).
 		script := `tell application "System Events" to keystroke ` + applescriptString(text)
-		cmd := exec.CommandContext(ctx, "osascript", "-e", script)
+		cmd := cmdx.Command(ctx, "osascript", "-e", script)
 		if out, err2 := cmd.CombinedOutput(); err2 == nil {
 			return nil
 		} else {
@@ -301,7 +303,7 @@ func keyOS(ctx context.Context, key string) error {
 		if !ok {
 			return fmt.Errorf("key: %v\n%s", err, permsHelpOS())
 		}
-		cmd := exec.CommandContext(ctx, "osascript", "-e", script)
+		cmd := cmdx.Command(ctx, "osascript", "-e", script)
 		if out, err2 := cmd.CombinedOutput(); err2 != nil {
 			return fmt.Errorf("key: %v; osascript: %v: %s\n%s", err, err2, strings.TrimSpace(string(out)), permsHelpOS())
 		}
@@ -310,7 +312,7 @@ func keyOS(ctx context.Context, key string) error {
 }
 
 func raiseChrome(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "osascript", "-e", `tell application "Google Chrome" to activate`)
+	cmd := cmdx.Command(ctx, "osascript", "-e", `tell application "Google Chrome" to activate`)
 	return cmd.Run()
 }
 
@@ -436,7 +438,7 @@ if (!ev) throw new Error("CGEventCreateMouseEvent failed");
 $.CGEventPost(0, ev);
 "ok";
 `
-	cmd := exec.CommandContext(ctx, "osascript", "-l", "JavaScript", "-e", script)
+	cmd := cmdx.Command(ctx, "osascript", "-l", "JavaScript", "-e", script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mouse move: %v: %s", err, strings.TrimSpace(string(out)))

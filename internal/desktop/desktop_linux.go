@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/rendicott/marble-desktop-peer/internal/cmdx"
 	"strconv"
 	"strings"
 )
@@ -28,7 +30,7 @@ func screenshotOS(ctx context.Context, out string) (coordW, coordH int, err erro
 		if _, err := exec.LookPath(t.name); err != nil {
 			continue
 		}
-		cmd := exec.CommandContext(ctx, t.name, t.args...)
+		cmd := cmdx.Command(ctx, t.name, t.args...)
 		ensureDisplay(cmd)
 		if outb, err := cmd.CombinedOutput(); err != nil {
 			lastErr = fmt.Errorf("%s: %v: %s", t.name, err, strings.TrimSpace(string(outb)))
@@ -118,7 +120,7 @@ func activeWindowOS(ctx context.Context) (title, app string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	cmd := exec.CommandContext(ctx, xd, "getactivewindow", "getwindowname")
+	cmd := cmdx.Command(ctx, xd, "getactivewindow", "getwindowname")
 	ensureDisplay(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -126,7 +128,7 @@ func activeWindowOS(ctx context.Context) (title, app string, err error) {
 	}
 	title = strings.TrimSpace(string(out))
 
-	cmd2 := exec.CommandContext(ctx, xd, "getactivewindow", "getwindowclassname")
+	cmd2 := cmdx.Command(ctx, xd, "getactivewindow", "getwindowclassname")
 	ensureDisplay(cmd2)
 	if out2, err2 := cmd2.CombinedOutput(); err2 == nil {
 		app = strings.TrimSpace(string(out2))
@@ -135,7 +137,7 @@ func activeWindowOS(ctx context.Context) (title, app string, err error) {
 }
 
 func xdotoolMoveClick(ctx context.Context, xd string, x, y int, button string, clear bool) error {
-	cmd := exec.CommandContext(ctx, xd, "mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y))
+	cmd := cmdx.Command(ctx, xd, "mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y))
 	ensureDisplay(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return xdotoolErr("mousemove", err, out)
@@ -145,7 +147,7 @@ func xdotoolMoveClick(ctx context.Context, xd string, x, y int, button string, c
 		args = append(args, "--clearmodifiers")
 	}
 	args = append(args, button)
-	cmd = exec.CommandContext(ctx, xd, args...)
+	cmd = cmdx.Command(ctx, xd, args...)
 	ensureDisplay(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return xdotoolErr("click", err, out)
@@ -154,13 +156,13 @@ func xdotoolMoveClick(ctx context.Context, xd string, x, y int, button string, c
 }
 
 func xdotoolMoveDownUp(ctx context.Context, xd string, x, y int, button string) error {
-	cmd := exec.CommandContext(ctx, xd, "mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y))
+	cmd := cmdx.Command(ctx, xd, "mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y))
 	ensureDisplay(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return xdotoolErr("mousemove", err, out)
 	}
 	for _, op := range []string{"mousedown", "mouseup"} {
-		cmd = exec.CommandContext(ctx, xd, op, button)
+		cmd = cmdx.Command(ctx, xd, op, button)
 		ensureDisplay(cmd)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return xdotoolErr(op, err, out)
@@ -174,7 +176,7 @@ func clickYdotool(ctx context.Context, x, y int, button string) error {
 	if err != nil {
 		return fmt.Errorf("ydotool not found")
 	}
-	cmd := exec.CommandContext(ctx, yd, "mousemove", "--absolute", "-x", strconv.Itoa(x), "-y", strconv.Itoa(y))
+	cmd := cmdx.Command(ctx, yd, "mousemove", "--absolute", "-x", strconv.Itoa(x), "-y", strconv.Itoa(y))
 	ensureDisplay(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ydotool mousemove: %v: %s", err, strings.TrimSpace(string(out)))
@@ -184,7 +186,7 @@ func clickYdotool(ctx context.Context, x, y int, button string) error {
 		{"click", "0xC0"},
 		{"click", button},
 	} {
-		cmd = exec.CommandContext(ctx, yd, args...)
+		cmd = cmdx.Command(ctx, yd, args...)
 		ensureDisplay(cmd)
 		if out, err := cmd.CombinedOutput(); err == nil {
 			return nil
@@ -199,7 +201,7 @@ func typeOS(ctx context.Context, text string) error {
 	xd, err := findXdotool()
 	if err == nil {
 		_ = raiseUsefulWindow(ctx, xd)
-		cmd := exec.CommandContext(ctx, xd, "type", "--clearmodifiers", "--delay", "12", "--", text)
+		cmd := cmdx.Command(ctx, xd, "type", "--clearmodifiers", "--delay", "12", "--", text)
 		ensureDisplay(cmd)
 		if out, err := cmd.CombinedOutput(); err == nil {
 			return nil
@@ -208,7 +210,7 @@ func typeOS(ctx context.Context, text string) error {
 		}
 	}
 	if wtype, err := exec.LookPath("wtype"); err == nil {
-		cmd := exec.CommandContext(ctx, wtype, "--", text)
+		cmd := cmdx.Command(ctx, wtype, "--", text)
 		ensureDisplay(cmd)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("wtype: %v: %s", err, strings.TrimSpace(string(out)))
@@ -225,7 +227,7 @@ func keyOS(ctx context.Context, key string) error {
 	xd, err := findXdotool()
 	if err == nil {
 		_ = raiseUsefulWindow(ctx, xd)
-		cmd := exec.CommandContext(ctx, xd, "key", "--clearmodifiers", key)
+		cmd := cmdx.Command(ctx, xd, "key", "--clearmodifiers", key)
 		ensureDisplay(cmd)
 		if out, err := cmd.CombinedOutput(); err == nil {
 			return nil
@@ -245,7 +247,7 @@ func keyOS(ctx context.Context, key string) error {
 		case "backspace":
 			k = "BackSpace"
 		}
-		cmd := exec.CommandContext(ctx, wtype, "-k", k)
+		cmd := cmdx.Command(ctx, wtype, "-k", k)
 		ensureDisplay(cmd)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("wtype key: %v: %s", err, strings.TrimSpace(string(out)))
@@ -261,7 +263,7 @@ func keyOS(ctx context.Context, key string) error {
 func raiseUsefulWindow(ctx context.Context, xd string) error {
 	classQueries := []string{"Google-chrome", "google-chrome", "Chromium", "chromium", "Firefox", "firefox"}
 	for _, class := range classQueries {
-		cmd := exec.CommandContext(ctx, xd, "search", "--onlyvisible", "--class", class)
+		cmd := cmdx.Command(ctx, xd, "search", "--onlyvisible", "--class", class)
 		ensureDisplay(cmd)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -272,14 +274,14 @@ func raiseUsefulWindow(ctx context.Context, xd string) error {
 			continue
 		}
 		wid := ids[len(ids)-1]
-		act := exec.CommandContext(ctx, xd, "windowactivate", "--sync", wid)
+		act := cmdx.Command(ctx, xd, "windowactivate", "--sync", wid)
 		ensureDisplay(act)
 		if err := act.Run(); err == nil {
 			return nil
 		}
 	}
 	for _, name := range []string{"Chrome", "Chromium", "Gmail", "UPS", "Firefox"} {
-		cmd := exec.CommandContext(ctx, xd, "search", "--onlyvisible", "--name", name)
+		cmd := cmdx.Command(ctx, xd, "search", "--onlyvisible", "--name", name)
 		ensureDisplay(cmd)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -290,7 +292,7 @@ func raiseUsefulWindow(ctx context.Context, xd string) error {
 			continue
 		}
 		wid := ids[len(ids)-1]
-		act := exec.CommandContext(ctx, xd, "windowactivate", "--sync", wid)
+		act := cmdx.Command(ctx, xd, "windowactivate", "--sync", wid)
 		ensureDisplay(act)
 		if err := act.Run(); err == nil {
 			return nil
@@ -345,7 +347,7 @@ func probeClickOS(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, xd, "getmouselocation")
+	cmd := cmdx.Command(ctx, xd, "getmouselocation")
 	ensureDisplay(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
