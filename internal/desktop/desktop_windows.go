@@ -16,11 +16,14 @@ import (
 	"unsafe"
 )
 
-// Windows desktop control with no CGO and no helper binaries: GDI BitBlt for
-// screenshots, SendInput for mouse/keyboard. The process is made DPI-aware at
-// startup so screenshot pixels and click coordinates are both physical pixels
-// (otherwise a 150% display reports a scaled-down virtual size and the click
-// space no longer matches the captured image).
+// Windows desktop control with no CGO. An interactive session captures with GDI
+// BitBlt and sends input with SendInput, in this process. A session-0 process
+// (only when attach is enabled) runs those same calls in a helper of this
+// binary inside the logged-on session — see session_attach_windows.go.
+// The process is made DPI-aware at startup so screenshot pixels and click
+// coordinates are both physical pixels (otherwise a 150% display reports a
+// scaled-down virtual size and the click space no longer matches the captured
+// image).
 
 var (
 	user32 = syscall.NewLazyDLL("user32.dll")
@@ -154,7 +157,7 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	}
 }
 
-func screenshotOS(ctx context.Context, out string) (coordW, coordH int, err error) {
+func screenshotHere(ctx context.Context, out string) (coordW, coordH int, err error) {
 	_ = ctx
 	w, h := screenSize()
 	if w <= 0 || h <= 0 {
@@ -248,7 +251,7 @@ func sendInput(p unsafe.Pointer, n int, size uintptr) error {
 	return nil
 }
 
-func clickOS(ctx context.Context, sx, sy int, button string) error {
+func clickHere(ctx context.Context, sx, sy int, button string) error {
 	var down, up uint32
 	var wheel int32
 	switch button {
@@ -305,7 +308,7 @@ func unicodeEvent(u uint16, up bool) inputKeyEvent {
 	return inputKeyEvent{typ: inputKeyboard, ki: keybdInput{scan: u, flags: flags}}
 }
 
-func typeOS(ctx context.Context, text string) error {
+func typeHere(ctx context.Context, text string) error {
 	var evs []inputKeyEvent
 	flush := func() error {
 		err := sendKeys(evs)
@@ -339,7 +342,7 @@ func typeOS(ctx context.Context, text string) error {
 	return nil
 }
 
-func keyOS(ctx context.Context, key string) error {
+func keyHere(ctx context.Context, key string) error {
 	spec, err := parseKeySpec(key)
 	if err != nil {
 		return fmt.Errorf("key: %w", err)
@@ -397,7 +400,7 @@ const processQueryLimitedInformation = 0x1000
 
 // activeWindowOS returns the foreground window's title and its owning
 // process's executable name (closest Windows analog to an "app name").
-func activeWindowOS(ctx context.Context) (title, app string, err error) {
+func activeWindowHere(ctx context.Context) (title, app string, err error) {
 	_ = ctx
 	hwnd, _, _ := procGetForegroundWindow.Call()
 	if hwnd == 0 {
@@ -435,21 +438,119 @@ func processNameByPID(pid uint32) string {
 	return filepath.Base(syscall.UTF16ToString(buf[:size]))
 }
 
-func availableOS() (bool, string) {
-	w, h := screenSize()
-	if w <= 0 || h <= 0 {
-		return false, "no primary display (not an interactive desktop session?)"
-	}
-	return true, fmt.Sprintf("Win32 GDI capture + SendInput, primary display %dx%d px", w, h)
-}
-
-func probeClickOS(ctx context.Context) error {
+func probeClickHere(ctx context.Context) error {
 	_ = ctx
 	var pt struct{ x, y int32 }
 	if r, _, e := procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))); r == 0 {
 		return fmt.Errorf("GetCursorPos: %v", e)
 	}
 	return nil
+}
+
+// captureRoute sends an interactive session down today's path without even
+// consulting the session-0 opt-in. Token duplication is only reachable once
+// this returns routeAttach.
+func captureRoute() int {
+	yes, _ := nonInteractiveSession()
+	attach := false
+	if yes {
+		attach = session0AttachEnabled()
+	}
+	return desktopRoute(yes, attach)
+}
+
+func screenshotOS(ctx context.Context, out string) (int, int, error) {
+	switch captureRoute() {
+	case routeAttach:
+		return screenshotSession0(ctx, out)
+	case routeRefuse:
+		return 0, 0, fmt.Errorf("screenshot: %s", session0AttachOffNote)
+	default:
+		return screenshotHere(ctx, out)
+	}
+}
+
+func clickOS(ctx context.Context, sx, sy int, button string) error {
+	switch captureRoute() {
+	case routeAttach:
+		return clickSession0(ctx, sx, sy, button)
+	case routeRefuse:
+		return fmt.Errorf("click: %s", session0AttachOffNote)
+	default:
+		return clickHere(ctx, sx, sy, button)
+	}
+}
+
+func typeOS(ctx context.Context, text string) error {
+	switch captureRoute() {
+	case routeAttach:
+		return typeSession0(ctx, text)
+	case routeRefuse:
+		return fmt.Errorf("type: %s", session0AttachOffNote)
+	default:
+		return typeHere(ctx, text)
+	}
+}
+
+func keyOS(ctx context.Context, key string) error {
+	switch captureRoute() {
+	case routeAttach:
+		return keySession0(ctx, key)
+	case routeRefuse:
+		return fmt.Errorf("key: %s", session0AttachOffNote)
+	default:
+		return keyHere(ctx, key)
+	}
+}
+
+func activeWindowOS(ctx context.Context) (string, string, error) {
+	switch captureRoute() {
+	case routeAttach:
+		return activeWindowSession0(ctx)
+	case routeRefuse:
+		return "", "", fmt.Errorf("active window: %s", session0AttachOffNote)
+	default:
+		return activeWindowHere(ctx)
+	}
+}
+
+func probeClickOS(ctx context.Context) error {
+	switch captureRoute() {
+	case routeAttach:
+		return probeClickSession0(ctx)
+	case routeRefuse:
+		return fmt.Errorf("probe: %s", session0AttachOffNote)
+	default:
+		return probeClickHere(ctx)
+	}
+}
+
+func availableOS() (bool, string) {
+	switch captureRoute() {
+	case routeAttach:
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		return session0Available(ctx)
+	case routeRefuse:
+		return false, session0AttachOffNote
+	default:
+		return availableInteractive()
+	}
+}
+
+// availableInteractive is the in-session probe. A working Default desktop keeps
+// the same true result as before. Lock / UAC (input desktop is not Default)
+// reports false — the same OpenInputDesktop check doctor already uses.
+func availableInteractive() (bool, string) {
+	w, h := screenSize()
+	if w <= 0 || h <= 0 {
+		return false, "no primary display (not an interactive desktop session?)"
+	}
+	note := fmt.Sprintf("Win32 GDI capture + SendInput, primary display %dx%d px", w, h)
+	if inputDesktopCapturable() {
+		return true, note
+	}
+	return false, secureDesktopNote
 }
 
 func queryPermsOS() Perms {

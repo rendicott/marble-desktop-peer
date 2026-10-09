@@ -26,6 +26,11 @@ type File struct {
 	BrowserMode string `json:"browser_mode,omitempty"`
 	// CDPPort: prefer attach to this port (0 = auto 9222/…); env MARBLE_PEER_CDP_PORT overrides.
 	CDPPort int `json:"cdp_port,omitempty"`
+	// Session0Desktop opts a non-interactive Windows peer (session 0) into
+	// attaching to the logged-on desktop. Nil means on for LocalSystem only.
+	// Ignored when the peer is already in an interactive session.
+	// MARBLE_PEER_SESSION0_DESKTOP overrides this.
+	Session0Desktop *bool `json:"session0_desktop,omitempty"`
 }
 
 // Harness is one paired Marble harness. Its device token lives in credentials.json.

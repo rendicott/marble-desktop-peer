@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [v0.2.4] — 2026-10-09
+
+### Windows session 0: capture the logged-on desktop when the peer is SYSTEM
+
+A peer started as `NT AUTHORITY\SYSTEM` in session 0 (SSM, a service, user-data)
+advertised `desktop: true` and then failed every screenshot with
+`BitBlt failed: Access is denied`. It now attaches to the logged-on console
+session and runs capture, click, type, and key there. A user-level install, in
+an interactive session, takes the same path it did before and does not need
+new privileges.
+
+`desktop` is false, with a reason, when nobody is logged on
+(`no interactive session (session 0, no logged-on user)`), the secure desktop
+is up (`secure desktop (locked or UAC prompt)`), or the attach is denied
+(`attach to session N denied: …`). A normal user process, including one that
+landed in session 0 over SSH, does not attach unless
+`MARBLE_PEER_SESSION0_DESKTOP=1` or `"session0_desktop": true`. Turn the
+SYSTEM default off with `MARBLE_PEER_SESSION0_DESKTOP=0` or
+`"session0_desktop": false`.
+
 ## [v0.2.3] — 2026-10-09
 
 ### Unattended enrollment with harness grants

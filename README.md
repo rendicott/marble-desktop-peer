@@ -137,9 +137,13 @@ marble-peer uninstall-autostart
 
 ### Windows
 
-Windows 10 / 11. Needs **Google Chrome** (Microsoft Edge is used as a fallback). Nothing else to install: screenshots use GDI and click/type/key use `SendInput` directly, so there are no helper tools, no CGO and no admin rights. The peer must run **inside an interactive desktop session** (Startup folder / a terminal you opened at the console or over RDP), not as a Windows service — a service has no desktop to capture.
+Windows 10 / 11. Needs **Google Chrome** (Microsoft Edge is used as a fallback). Nothing else to install: screenshots use GDI and click/type/key use `SendInput` directly, so there are no helper tools, no CGO and no admin rights for a normal install.
 
-> **Setting this up over plain SSH?** OpenSSH on Windows lands your shell in **session 0**, the non-interactive "Services" session — there is no desktop there at all, so screenshot and input are structurally impossible, not just locked. `doctor` reports it plainly (`lock: locked=true source=session ...`) rather than the generic secure-desktop message. SSH in to install the binary, but *launch* and *run doctor* via a scheduled task started into the interactive session (`/it`) instead of directly from the SSH shell:
+The supported install runs **as the user, in that user's interactive session** (Startup folder, or a terminal at the console or over RDP). That path does not attach to other sessions and does not need extra privileges.
+
+A peer that provisioning starts **as `SYSTEM` in session 0** (SSM, a service, EC2 user-data) attaches to the logged-on desktop: capture and input run in a helper process in that session. `desktop` stays false, with a reason, when nobody is logged on, the secure desktop is up (lock or UAC), or the attach is denied. A user-level process — including one that landed in session 0 over SSH — does not do this. Turn it on with `MARBLE_PEER_SESSION0_DESKTOP=1` or `"session0_desktop": true` in `config.json` (it still needs `SeTcbPrivilege`, which `SYSTEM` already holds). Turn it off with `MARBLE_PEER_SESSION0_DESKTOP=0` or `"session0_desktop": false`.
+
+> **Setting this up over plain SSH as a normal user?** OpenSSH on Windows lands your shell in **session 0**. Session-0 attach stays off for a user process, and a user token cannot take the interactive desktop anyway. `doctor` reports it plainly (`lock: locked=true source=session ...`). SSH in to install the binary, but *launch* and *run doctor* via a scheduled task started into the interactive session (`/it`) instead of directly from the SSH shell:
 >
 > ```powershell
 > schtasks /create /tn marble-peer-doctor /tr "$HOME\.local\bin\marble-peer.exe doctor --screenshot" /sc onstart /ru "$env:USERNAME" /it /rl highest /f

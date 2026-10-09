@@ -4,6 +4,7 @@ package desktop
 
 import (
 	"context"
+	"syscall"
 	"testing"
 	"unsafe"
 )
@@ -20,6 +21,26 @@ func TestInputStructSizes(t *testing.T) {
 	}
 	if got := unsafe.Sizeof(inputKeyEvent{}); got != want {
 		t.Fatalf("inputKeyEvent size = %d, want %d", got, want)
+	}
+}
+
+// Session-0 attach passes STARTUPINFOEXW and walks WTS_SESSION_INFOW by size.
+// A mismatch here would make CreateProcessAsUser or session enumeration wrong.
+func TestSessionAttachStructLayout(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("layout is pinned for 64-bit")
+	}
+	if got := unsafe.Sizeof(syscall.StartupInfo{}); got != 104 {
+		t.Fatalf("STARTUPINFOW = %d, want 104", got)
+	}
+	if got := unsafe.Sizeof(startupInfoEx{}); got != 112 {
+		t.Fatalf("STARTUPINFOEXW = %d, want 112", got)
+	}
+	if got := unsafe.Sizeof(wtsSessionInfo{}); got != 24 {
+		t.Fatalf("WTS_SESSION_INFOW = %d, want 24", got)
+	}
+	if got := unsafe.Sizeof(syscall.ProcessInformation{}); got != 24 {
+		t.Fatalf("PROCESS_INFORMATION = %d, want 24", got)
 	}
 }
 

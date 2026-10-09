@@ -2,7 +2,8 @@
 //
 // Linux: GNOME/XWayland tools (grim, gnome-screenshot, xdotool).
 // macOS: screencapture + a compiled Swift helper (CGEvent) for click/type/key.
-// Windows: GDI screen capture + SendInput via user32/gdi32 (no CGO, no helpers).
+// Windows: GDI screen capture + SendInput via user32/gdi32 (no CGO). Session 0
+// as LocalSystem runs those calls in a helper process in the logged-on session.
 package desktop
 
 import (

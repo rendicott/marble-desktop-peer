@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"testing"
 )
@@ -60,5 +61,29 @@ func TestLoadMigratesSingleHarness(t *testing.T) {
 	toks, _ = LoadTokens()
 	if _, ok := toks["http://h1:8080"]; ok || toks["http://h2"] != "s2" {
 		t.Fatalf("ClearToken(one): %v", toks)
+	}
+}
+
+func TestSession0DesktopTriState(t *testing.T) {
+	var unset File
+	if err := json.Unmarshal([]byte(`{}`), &unset); err != nil {
+		t.Fatal(err)
+	}
+	if unset.Session0Desktop != nil {
+		t.Fatalf("missing field should be nil, got %v", *unset.Session0Desktop)
+	}
+	var off File
+	if err := json.Unmarshal([]byte(`{"session0_desktop":false}`), &off); err != nil {
+		t.Fatal(err)
+	}
+	if off.Session0Desktop == nil || *off.Session0Desktop {
+		t.Fatalf("explicit false: %v", off.Session0Desktop)
+	}
+	var on File
+	if err := json.Unmarshal([]byte(`{"session0_desktop":true}`), &on); err != nil {
+		t.Fatal(err)
+	}
+	if on.Session0Desktop == nil || !*on.Session0Desktop {
+		t.Fatalf("explicit true: %v", on.Session0Desktop)
 	}
 }

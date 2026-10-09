@@ -175,6 +175,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "\n# Quit all Chrome windows first, then run the command above.")
 		fmt.Fprintln(os.Stderr, "# Leave that Chrome open; in another terminal: marble-peer run")
 		fmt.Fprintln(os.Stderr, "# Peer attaches to port 9222 and uses YOUR profile (cookies/logins).")
+	case "desktop-worker":
+		// Internal. A session-0 peer starts this inside the logged-on session.
+		if err := desktop.RunSessionWorker(); err != nil {
+			fmt.Fprintln(os.Stderr, "desktop-worker:", err)
+			os.Exit(1)
+		}
 	case "doctor":
 		fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 		openSettings := fs.Bool("open-settings", false, "Open macOS Privacy Settings panes")

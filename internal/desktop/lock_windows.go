@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -36,11 +37,12 @@ type userObjectFlags struct {
 // nonInteractiveSession detects the case Windows OpenSSH hits by default: the
 // server (and any shell it spawns) runs in session 0, the non-interactive
 // "Services" session, which has no desktop a GUI can draw on or receive input
-// from. That is a structural limitation, not a locked/secure-desktop state —
-// OpenInputDesktop, BitBlt and SendInput all fail here no matter what account
-// runs the process. Distinguishing it from a genuinely locked workstation lets
-// doctor point at the real fix (run from an interactive session) instead of
-// "unlock the screen".
+// from. That is a structural limitation, not a locked/secure-desktop state.
+// A user process cannot capture from here. A LocalSystem process may attach
+// to the logged-on session instead (see session_attach_windows.go); that path
+// is off unless this process is SYSTEM or the operator opts in.
+// Distinguishing session 0 from a genuinely locked workstation lets doctor
+// point at the real fix instead of "unlock the screen".
 func nonInteractiveSession() (bool, string) {
 	pid, _, _ := procGetCurrentProcessId.Call()
 	var sessionID uint32
@@ -67,14 +69,48 @@ func nonInteractiveSession() (bool, string) {
 // no interactive window station at all (e.g. over plain SSH, landing in
 // session 0) looks similar but needs a different fix — see nonInteractiveSession.
 func queryLockWindows(ctx context.Context) LockState {
-	_ = ctx
 	if yes, why := nonInteractiveSession(); yes {
+		if session0AttachEnabled() {
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			return queryLockSession0(ctx)
+		}
 		return LockState{Locked: true, Source: "session",
 			Detail: fmt.Sprintf("running in %s — there is no interactive desktop to screenshot or send input to. "+
 				"Launch marble-peer from an interactive session (console/RDP) or, for remote/headless setup, "+
 				"a scheduled task run with `schtasks /create ... /it` (interactive session 1). "+
 				"Plain SSH alone cannot run the desktop features.", why)}
 	}
+	return queryLockInteractive(ctx)
+}
+
+// inputDesktopCapturable reports whether this process can open the input
+// desktop and that desktop is "Default". A query failure after a successful
+// open is treated as capturable so a working session is not marked down.
+func inputDesktopCapturable() bool {
+	const desktopReadObjects = 0x0001
+	const uoiName = 2
+	h, _, _ := procOpenInputDesktop.Call(0, 0, desktopReadObjects)
+	if h == 0 {
+		return false
+	}
+	defer procCloseDesktop.Call(h)
+	var name [128]uint16
+	var need uint32
+	r, _, _ := procGetUserObjectInformationW.Call(h, uoiName,
+		uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)*2), uintptr(unsafe.Pointer(&need)))
+	if r == 0 {
+		return true
+	}
+	n := syscall.UTF16ToString(name[:])
+	return n == "" || strings.EqualFold(n, "Default")
+}
+
+func queryLockInteractive(ctx context.Context) LockState {
+	_ = ctx
 	const desktopReadObjects = 0x0001
 	const uoiName = 2
 	h, _, e := procOpenInputDesktop.Call(0, 0, desktopReadObjects)
