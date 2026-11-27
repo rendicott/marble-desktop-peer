@@ -51,6 +51,11 @@ type App struct {
 	confirmMu   sync.Mutex
 	confirmCh   map[string]chan bool
 	confirmMeta map[string]ConfirmRequest // pending UI metadata
+
+	// focusedAfterClick is the frontmost app sampled after the last successful
+	// desktop_click. Empty means there is nothing to assert before type/key.
+	focusMu           sync.Mutex
+	focusedAfterClick string
 }
 
 // ConfirmRequest is a high-risk action waiting for the human on the peer machine.
@@ -316,6 +321,7 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		}
 		text := fmt.Sprintf("clicked image=(%d,%d) screen=(%d,%d) button=%s", x, y, sx, sy, btn)
 		envOut := protocol.Envelope{OK: true, Text: text}
+		var clickedApp string
 		if shotErr == nil {
 			ls := desktop.QueryLockState(ctx)
 			envOut.ScreenshotB64 = base64.StdEncoding.EncodeToString(img)
@@ -323,7 +329,7 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 				"locked": ls.Locked, "lock_source": ls.Source,
 				"last_click": map[string]int{"x": x, "y": y},
 			}
-			addActiveWindow(ctx, extra)
+			clickedApp = addActiveWindow(ctx, extra)
 			envOut.Meta = desktop.MetaMap(meta, extra)
 			if ls.Locked {
 				envOut.Text = text + "\n" + desktop.FormatLockWarning(ls)
@@ -333,9 +339,16 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 				"post_click_screenshot_error": shotErr.Error(),
 				"last_click":                  map[string]int{"x": x, "y": y},
 			}
+			_, clickedApp, _ = desktop.ActiveWindow(ctx)
 		}
+		// Remember even when the name is empty: this click may have moved focus,
+		// and a stale app from an earlier click must not keep blocking type/key.
+		a.setExpectedFocus(clickedApp)
 		return envOut
 	case "desktop_type":
+		if env := a.guardDesktopFocus(ctx, env.Kind); env != nil {
+			return *env
+		}
 		text, _ := payload["text"].(string)
 		if err := desktop.Type(ctx, text); err != nil {
 			return protocol.Envelope{OK: false, Error: err.Error()}
@@ -344,27 +357,18 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		// it the harness has no "did my keystrokes land?" signal and (per field
 		// report peer-gui-loop-report, 2026-09-23) can retype the same text into
 		// an unfocused window indefinitely with no visible failure.
-		img, meta, shotErr := desktop.ScreenshotSticky(ctx)
-		envOut := protocol.Envelope{OK: true}
-		if shotErr == nil {
-			ls := desktop.QueryLockState(ctx)
-			envOut.ScreenshotB64 = base64.StdEncoding.EncodeToString(img)
-			extra := map[string]interface{}{"locked": ls.Locked, "lock_source": ls.Source}
-			addActiveWindow(ctx, extra)
-			envOut.Meta = desktop.MetaMap(meta, extra)
-			if ls.Locked {
-				envOut.Text = desktop.FormatLockWarning(ls)
-			}
-		} else {
-			envOut.Meta = map[string]interface{}{"post_type_screenshot_error": shotErr.Error()}
-		}
-		return envOut
+		return finishInputAction(ctx, "post_type_screenshot_error")
 	case "desktop_key":
+		if env := a.guardDesktopFocus(ctx, env.Kind); env != nil {
+			return *env
+		}
 		key, _ := payload["key"].(string)
 		if err := desktop.Key(ctx, key); err != nil {
 			return protocol.Envelope{OK: false, Error: err.Error()}
 		}
-		return protocol.Envelope{OK: true}
+		// Same post-action screenshot and focused_app as desktop_type. A bare
+		// ok left the harness with no way to see where the key landed.
+		return finishInputAction(ctx, "post_key_screenshot_error")
 	case "browser_ensure":
 		force, _ := payload["force"].(bool)
 		er, err := a.Browser.Ensure(ctx, force)
@@ -452,18 +456,85 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 // addActiveWindow best-effort adds focused_app/window_title to a Meta map so
 // the harness can tell "did my keystrokes land where I think?" without a
 // second call (field report peer-gui-loop-report, 2026-09-23, P2). Silent on
-// error/unsupported platform — this is advisory, never blocking.
-func addActiveWindow(ctx context.Context, extra map[string]interface{}) {
-	title, app, err := desktop.ActiveWindow(ctx)
+// error/unsupported platform — this is advisory, never blocking. The returned
+// app name is empty when it could not be read.
+func addActiveWindow(ctx context.Context, extra map[string]interface{}) string {
+	title, appName, err := desktop.ActiveWindow(ctx)
 	if err != nil {
-		return
+		return ""
 	}
 	if title != "" {
 		extra["window_title"] = title
 	}
-	if app != "" {
-		extra["focused_app"] = app
+	if appName != "" {
+		extra["focused_app"] = appName
 	}
+	return appName
+}
+
+// finishInputAction attaches the post-action screenshot and focused window
+// that desktop_type and desktop_key both return. errMetaKey is the meta field
+// used when the screenshot itself fails.
+func finishInputAction(ctx context.Context, errMetaKey string) protocol.Envelope {
+	img, meta, shotErr := desktop.ScreenshotSticky(ctx)
+	envOut := protocol.Envelope{OK: true}
+	if shotErr != nil {
+		envOut.Meta = map[string]interface{}{errMetaKey: shotErr.Error()}
+		return envOut
+	}
+	ls := desktop.QueryLockState(ctx)
+	envOut.ScreenshotB64 = base64.StdEncoding.EncodeToString(img)
+	extra := map[string]interface{}{"locked": ls.Locked, "lock_source": ls.Source}
+	addActiveWindow(ctx, extra)
+	envOut.Meta = desktop.MetaMap(meta, extra)
+	if ls.Locked {
+		envOut.Text = desktop.FormatLockWarning(ls)
+	}
+	return envOut
+}
+
+// guardDesktopFocus refuses desktop_type and desktop_key when the frontmost
+// app differs from the app sampled after the last successful desktop_click.
+// No remembered app, or a frontmost app that could not be read, is not a
+// mismatch: input proceeds. A refusal is OK:false and names both apps.
+func (a *App) guardDesktopFocus(ctx context.Context, kind string) *protocol.Envelope {
+	if kind != "desktop_type" && kind != "desktop_key" {
+		return nil
+	}
+	expected := a.expectedFocusApp()
+	if strings.TrimSpace(expected) == "" {
+		return nil
+	}
+	_, focused, err := desktop.ActiveWindow(ctx)
+	if err != nil {
+		log.Printf("desktop: %s focus sample failed (%v); injecting because the frontmost app is unknown", kind, err)
+		return nil
+	}
+	if desktop.CompareFocus(expected, focused) != desktop.FocusMismatch {
+		return nil
+	}
+	env := protocol.Envelope{
+		OK:    false,
+		Error: desktop.FocusMismatchError(expected, focused),
+		Meta: map[string]interface{}{
+			"expected_app": strings.TrimSpace(expected),
+			"focused_app":  strings.TrimSpace(focused),
+		},
+	}
+	log.Printf("desktop: refusing %s: %s", kind, env.Error)
+	return &env
+}
+
+func (a *App) setExpectedFocus(appName string) {
+	a.focusMu.Lock()
+	a.focusedAfterClick = strings.TrimSpace(appName)
+	a.focusMu.Unlock()
+}
+
+func (a *App) expectedFocusApp() string {
+	a.focusMu.Lock()
+	defer a.focusMu.Unlock()
+	return a.focusedAfterClick
 }
 
 // ensureBrowser makes CDP ready without force-killing the user's Chrome.

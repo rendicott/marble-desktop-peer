@@ -6,6 +6,39 @@ import (
 	"testing"
 )
 
+func TestCompareFocus(t *testing.T) {
+	cases := []struct {
+		expected, focused string
+		want              FocusVerdict
+	}{
+		{expected: "TextEdit", focused: "TextEdit", want: FocusMatch},
+		{expected: "  TextEdit  ", focused: "TextEdit", want: FocusMatch},
+		{expected: "TextEdit", focused: " TextEdit\n", want: FocusMatch},
+		{expected: "Google Chrome", focused: "TextEdit", want: FocusMismatch},
+		{expected: "TextEdit", focused: "textedit", want: FocusMismatch},
+		{expected: "", focused: "TextEdit", want: FocusUnknown},
+		{expected: "TextEdit", focused: "", want: FocusUnknown},
+		{expected: "", focused: "", want: FocusUnknown},
+		{expected: "   ", focused: "TextEdit", want: FocusUnknown},
+		{expected: "TextEdit", focused: "  \t", want: FocusUnknown},
+	}
+	for _, tc := range cases {
+		got := CompareFocus(tc.expected, tc.focused)
+		if got != tc.want {
+			t.Errorf("CompareFocus(%q, %q) = %q, want %q", tc.expected, tc.focused, got, tc.want)
+		}
+	}
+}
+
+func TestFocusMismatchErrorNamesBoth(t *testing.T) {
+	got := FocusMismatchError(" TextEdit ", "Google Chrome")
+	for _, name := range []string{"TextEdit", "Google Chrome"} {
+		if !strings.Contains(got, name) {
+			t.Errorf("error %q does not name %s", got, name)
+		}
+	}
+}
+
 // TestNoActivateBeforeInput fails if type/key/click raise an application.
 // macOS used to osascript-activate Google Chrome, and Linux used to
 // windowactivate a browser, before injecting keystrokes. Those events then
