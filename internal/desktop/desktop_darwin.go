@@ -278,7 +278,8 @@ end tell`
 }
 
 func typeOS(ctx context.Context, text string) error {
-	_ = raiseChrome(ctx)
+	// Input goes to the already-frontmost window. Raising another application
+	// here sent keystrokes into the operator's logged-in browser.
 	if _, err := runDesk(ctx, "type", text); err == nil {
 		return nil
 	} else {
@@ -295,7 +296,7 @@ func typeOS(ctx context.Context, text string) error {
 }
 
 func keyOS(ctx context.Context, key string) error {
-	_ = raiseChrome(ctx)
+	// See typeOS: never raise an application before injecting a key.
 	if _, err := runDesk(ctx, "key", key); err == nil {
 		return nil
 	} else {
@@ -309,11 +310,6 @@ func keyOS(ctx context.Context, key string) error {
 		}
 		return nil
 	}
-}
-
-func raiseChrome(ctx context.Context) error {
-	cmd := cmdx.Command(ctx, "osascript", "-e", `tell application "Google Chrome" to activate`)
-	return cmd.Run()
 }
 
 func applescriptString(s string) string {

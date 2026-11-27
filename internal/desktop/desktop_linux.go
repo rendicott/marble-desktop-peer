@@ -200,7 +200,8 @@ func clickYdotool(ctx context.Context, x, y int, button string) error {
 func typeOS(ctx context.Context, text string) error {
 	xd, err := findXdotool()
 	if err == nil {
-		_ = raiseUsefulWindow(ctx, xd)
+		// Input goes to the already-focused window. Searching out a browser
+		// (or Gmail/UPS) and raising it sent keystrokes into that window.
 		cmd := cmdx.Command(ctx, xd, "type", "--clearmodifiers", "--delay", "12", "--", text)
 		ensureDisplay(cmd)
 		if out, err := cmd.CombinedOutput(); err == nil {
@@ -226,7 +227,7 @@ func typeOS(ctx context.Context, text string) error {
 func keyOS(ctx context.Context, key string) error {
 	xd, err := findXdotool()
 	if err == nil {
-		_ = raiseUsefulWindow(ctx, xd)
+		// See typeOS: never raise a window before injecting a key.
 		cmd := cmdx.Command(ctx, xd, "key", "--clearmodifiers", key)
 		ensureDisplay(cmd)
 		if out, err := cmd.CombinedOutput(); err == nil {
@@ -258,47 +259,6 @@ func keyOS(ctx context.Context, key string) error {
 		return err
 	}
 	return fmt.Errorf("key failed")
-}
-
-func raiseUsefulWindow(ctx context.Context, xd string) error {
-	classQueries := []string{"Google-chrome", "google-chrome", "Chromium", "chromium", "Firefox", "firefox"}
-	for _, class := range classQueries {
-		cmd := cmdx.Command(ctx, xd, "search", "--onlyvisible", "--class", class)
-		ensureDisplay(cmd)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			continue
-		}
-		ids := strings.Fields(string(out))
-		if len(ids) == 0 {
-			continue
-		}
-		wid := ids[len(ids)-1]
-		act := cmdx.Command(ctx, xd, "windowactivate", "--sync", wid)
-		ensureDisplay(act)
-		if err := act.Run(); err == nil {
-			return nil
-		}
-	}
-	for _, name := range []string{"Chrome", "Chromium", "Gmail", "UPS", "Firefox"} {
-		cmd := cmdx.Command(ctx, xd, "search", "--onlyvisible", "--name", name)
-		ensureDisplay(cmd)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			continue
-		}
-		ids := strings.Fields(string(out))
-		if len(ids) == 0 {
-			continue
-		}
-		wid := ids[len(ids)-1]
-		act := cmdx.Command(ctx, xd, "windowactivate", "--sync", wid)
-		ensureDisplay(act)
-		if err := act.Run(); err == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("no focusable window")
 }
 
 func xdotoolErr(op string, err error, out []byte) error {
