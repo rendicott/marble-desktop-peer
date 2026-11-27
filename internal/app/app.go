@@ -300,6 +300,9 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 			Text:          text,
 		}
 	case "desktop_click":
+		if env := a.guardDesktopFocus(ctx, env.Kind, payload); env != nil {
+			return *env
+		}
 		x, _ := asInt(payload["x"])
 		y, _ := asInt(payload["y"])
 		btn := asButton(payload["button"])
@@ -346,7 +349,7 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		a.setExpectedFocus(clickedApp)
 		return envOut
 	case "desktop_type":
-		if env := a.guardDesktopFocus(ctx, env.Kind); env != nil {
+		if env := a.guardDesktopFocus(ctx, env.Kind, payload); env != nil {
 			return *env
 		}
 		text, _ := payload["text"].(string)
@@ -359,7 +362,7 @@ func (a *App) exec(ctx context.Context, env protocol.Envelope) protocol.Envelope
 		// an unfocused window indefinitely with no visible failure.
 		return finishInputAction(ctx, "post_type_screenshot_error")
 	case "desktop_key":
-		if env := a.guardDesktopFocus(ctx, env.Kind); env != nil {
+		if env := a.guardDesktopFocus(ctx, env.Kind, payload); env != nil {
 			return *env
 		}
 		key, _ := payload["key"].(string)
@@ -493,11 +496,42 @@ func finishInputAction(ctx context.Context, errMetaKey string) protocol.Envelope
 	return envOut
 }
 
-// guardDesktopFocus refuses desktop_type and desktop_key when the frontmost
-// app differs from the app sampled after the last successful desktop_click.
-// No remembered app, or a frontmost app that could not be read, is not a
-// mismatch: input proceeds. A refusal is OK:false and names both apps.
-func (a *App) guardDesktopFocus(ctx context.Context, kind string) *protocol.Envelope {
+// guardDesktopFocus refuses an action that would inject input into the wrong
+// app. expect_app, when set, is activated on macOS and must be frontmost
+// afterwards; a mismatch or an unsafe name returns OK:false and does not
+// inject. With no expect_app, desktop_type and desktop_key are refused when
+// the frontmost app differs from the app sampled after the last successful
+// desktop_click. No remembered app, or a frontmost app that could not be
+// read, is not a mismatch: input proceeds.
+func (a *App) guardDesktopFocus(ctx context.Context, kind string, payload map[string]interface{}) *protocol.Envelope {
+	if name, badType, ok := payloadExpectApp(payload); badType || ok {
+		if badType || !desktop.ValidExpectApp(name) {
+			msg := fmt.Sprintf("invalid expect_app %q", name)
+			meta := map[string]interface{}{"expected_app": name}
+			if badType {
+				msg = "invalid expect_app: expected a string"
+				meta = map[string]interface{}{}
+			}
+			env := protocol.Envelope{OK: false, Error: msg, Meta: meta}
+			return &env
+		}
+		focused, err := desktop.ActivateExpectApp(ctx, name)
+		if err != nil {
+			env := protocol.Envelope{
+				OK:    false,
+				Error: err.Error(),
+				Meta: map[string]interface{}{
+					"expected_app": name,
+					"focused_app":  focused,
+				},
+			}
+			log.Printf("desktop: refusing %s: %s", kind, env.Error)
+			return &env
+		}
+		// The caller named the app and it is frontmost. Do not also apply the
+		// post-click expectation, which may be a different app on purpose.
+		return nil
+	}
 	if kind != "desktop_type" && kind != "desktop_key" {
 		return nil
 	}
@@ -523,6 +557,28 @@ func (a *App) guardDesktopFocus(ctx context.Context, kind string) *protocol.Enve
 	}
 	log.Printf("desktop: refusing %s: %s", kind, env.Error)
 	return &env
+}
+
+// payloadExpectApp reads expect_app. ok is false when the field is absent or
+// blank (blank keeps the previous behaviour). badType is true when the field
+// is present but not a string.
+func payloadExpectApp(payload map[string]interface{}) (name string, badType bool, ok bool) {
+	if payload == nil {
+		return "", false, false
+	}
+	v, exists := payload["expect_app"]
+	if !exists || v == nil {
+		return "", false, false
+	}
+	s, isString := v.(string)
+	if !isString {
+		return "", true, false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false, false
+	}
+	return s, false, true
 }
 
 func (a *App) setExpectedFocus(appName string) {

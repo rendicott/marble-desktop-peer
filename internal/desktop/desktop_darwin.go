@@ -312,6 +312,22 @@ func keyOS(ctx context.Context, key string) error {
 	}
 }
 
+// activateAppOS brings name to the front. The name is checked again here so
+// the AppleScript line below cannot include a quote, semicolon, or newline.
+// Callers use this only when the action set expect_app. type/key/click do not.
+func activateAppOS(ctx context.Context, name string) error {
+	if !ValidExpectApp(name) {
+		return fmt.Errorf("invalid expect_app %q", name)
+	}
+	script := `tell application "` + name + `" to activate`
+	cmd := cmdx.Command(ctx, "osascript", "-e", script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("activate %q: %v: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func applescriptString(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, `"`, `\"`)
