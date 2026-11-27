@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## [v0.2.7] — 2026-11-27
+
+### Stop sending keystrokes to the operator's browser
+
+On macOS, `desktop_type` and `desktop_key` activated Google Chrome before
+injecting input. On Linux they activated a visible Chrome, Chromium, Firefox,
+Gmail, or UPS window. The keystrokes then went to whatever was frontmost, so
+an agent's typing (an email, a token) landed in the operator's logged-in
+browser.
+
+Darwin and Linux no longer activate a browser before keystrokes. The peer does
+not activate any app before injecting input unless the action sets `expect_app`.
+
+After a successful `desktop_click`, the peer remembers that call's `focused_app`.
+Before `desktop_type` or `desktop_key`, it samples the frontmost app again. When
+the remembered app is set and differs, the peer does not inject: the result is
+`ok: false` with `expected_app`, `focused_app`, and an error that names both.
+
+`desktop_type`, `desktop_key`, and `desktop_click` take an optional `expect_app`.
+On macOS, when it is set, the peer activates that app, samples the frontmost
+app, and returns an error if the frontmost app still differs. The name is
+checked against `^[A-Za-z0-9 ._-]{1,64}$` before it is placed in AppleScript.
+Leaving `expect_app` out keeps the previous behaviour, minus the browser
+activation. Off macOS the field does not raise a window; the action is refused
+when the frontmost app is not the one named.
+
+`desktop_key` now returns a post-action screenshot and `focused_app` /
+`window_title` in `meta`, the same as `desktop_type`.
+
 ## [v0.2.6] — 2026-10-09
 
 ### Action queue: a stuck command no longer wedges the peer
